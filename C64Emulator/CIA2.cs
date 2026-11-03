@@ -1,237 +1,109 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
+using System;
 
 namespace C64Emulator
 {
-    class CIA2
+    internal sealed class CIA2 : Cia6526
     {
-        private const ushort CIA2_POS = 0xDD00;
-        private const int CIA2_SIZE = 0xFF;
+        private const int CiaSize = 0x10;
 
-        private const int CLOCK_CYCLES = 100000;
+        private readonly IVideoBank videoBank;
+        private readonly IecBus? iec;
 
-        private byte timeTenthSecs = 0;
-        private byte timeSeconds = 0;
-        private byte timeMinutes = 0;
-        private byte timeHours = 0;
-        private bool timePM = false;
-
-        private bool paused = false;
-
-        private int timerAValue = 0;
-        private int timerAStartValue = 0;
-        private bool timerAEnabled = false;
-        private bool timerAPortBUnderflow = false;
-        private bool timerAPortBInvert = true;
-        private bool timerARestart = true;
-
-        private int timerBValue = 0;
-        private int timerBStartValue = 0;
-        private bool timerBEnabled = false;
-        private bool timerBPortBUnderflow = false;
-        private bool timerBPortBInvert = true;
-        private bool timerBRestart = true;
-
-        private bool timerAUnderflow = false;
-        private bool timerBUnderflow = false;
-
-        private bool invertPortBBit6 = false;
-
-        private byte interruptStatus = 0;
-
-        private int clockCycles = 0;
-
-        public CIA2()
+        public CIA2(
+            InterruptLine interrupts,
+            IVideoBank videoBank,
+            IecBus? iec = null)
+            : base(interrupts, InterruptSource.Cia2, useNmi: true)
         {
-            timeTenthSecs = (byte)(DateTime.Now.Millisecond / 100);
-            timeSeconds = (byte)DateTime.Now.Second;
-            timeMinutes = (byte)DateTime.Now.Minute;
-            timeHours = (byte)(DateTime.Now.Hour % 12);
-            timePM = (DateTime.Now.Hour >= 12);
+            this.videoBank = videoBank ?? throw new ArgumentNullException(nameof(videoBank));
+            this.iec = iec;
         }
 
-        public void ProcessTimers(int cycles)
+        public int Size => CiaSize;
+
+        public ushort Position => AddressMap.Cia2Start;
+
+        public override void Reset()
         {
-            clockCycles += cycles;
-
-            if (clockCycles >= CLOCK_CYCLES)
-            {
-                clockCycles -= CLOCK_CYCLES;
-
-                timeTenthSecs++;
-
-                if (timeTenthSecs == 10)
-                {
-                    timeTenthSecs = 0;
-
-                    timeSeconds++;
-
-                    if (timeSeconds == 60)
-                    {
-                        timeSeconds = 0;
-
-                        timeMinutes++;
-
-                        if (timeMinutes == 60)
-                        {
-                            timeMinutes = 0;
-
-                            timeHours++;
-
-                            if (timeHours == 12)
-                            {
-                                timeHours = 0;
-
-                                timePM = !timePM;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (timerAEnabled)
-            {
-                timerAValue -= cycles;
-                invertPortBBit6 = false;
-
-                if (timerAValue <= 0)
-                {
-                    interruptStatus = 1;
-
-                    if (timerAPortBUnderflow && timerAPortBInvert)
-                        invertPortBBit6 = true;
-
-                    if (timerAUnderflow)
-                    {
-                        interruptStatus = 0x81;
-                        C64.cpu.IRQ();
-                    }
-
-                    if (!timerARestart)
-                    {
-                        timerAValue = timerAStartValue;
-                        timerAEnabled = false;
-                    }
-                    else
-                    {
-                        if (timerAStartValue == 0)
-                            timerAValue = 0;
-                        else
-                            while (timerAValue < 0)
-                                timerAValue = timerAStartValue + timerAValue;
-                    }
-                }
-            }
-            if (timerBEnabled)
-            {
-                timerBValue -= cycles;
-                invertPortBBit6 = false;
-
-                if (timerBValue <= 0)
-                {
-                    interruptStatus = 2;
-
-                    if (timerBPortBUnderflow && timerBPortBInvert)
-                        invertPortBBit6 = true;
-
-                    if (timerBUnderflow)
-                    {
-                        interruptStatus = 0x82;
-                        C64.cpu.IRQ();
-                    }
-
-                    if (!timerBRestart)
-                    {
-                        timerBValue = timerBStartValue;
-                        timerBEnabled = false;
-                    }
-                    else
-                    {
-                        if (timerBStartValue == 0)
-                            timerBValue = 0;
-                        else
-                            while (timerBValue < 0)
-                                timerBValue = timerBStartValue + timerBValue;
-                    }
-                }
-            }
-        }
-
-        public int Size
-        {
-            get
-            {
-                return CIA2_SIZE;
-            }
-        }
-
-        public ushort Position
-        {
-            get
-            {
-                return CIA2_POS;
-            }
+            base.Reset();
+            UpdateVideoBank();
+            iec?.SetC64(PortAOutput, PortADirection);
         }
 
         public byte Peek(ushort address)
         {
             switch (address)
             {
-                case 0x01: return (byte)(invertPortBBit6 ? 0xBF : 0xFF);
-                case 0x04: return (byte)(timerAValue & 0xFF);
-                case 0x05: return (byte)((timerAValue >> 8) & 0xFF);
-                case 0x06: return (byte)(timerBValue & 0xFF);
-                case 0x07: return (byte)((timerBValue >> 8) & 0xFF);
-                case 0x08: return timeTenthSecs;
-                case 0x09: return timeSeconds;
-                case 0x0A: return timeMinutes;
-                case 0x0B: return (byte)(timeHours | (timePM ? 0x80 : 0));
-                case 0x0D:
-                    byte status = interruptStatus;
-                    interruptStatus = 0;
-                    return status;
-            }
+                case 0x00:
+                {
+                    byte value = ReadPort(PortAOutput, PortADirection);
 
-            return 0xFF;
+                    if (iec is not null)
+                    {
+                        value = (byte)(
+                            (value & 0x3F) |
+                            (iec.ClockHigh ? 0x40 : 0x00) |
+                            (iec.DataHigh ? 0x80 : 0x00));
+                    }
+
+                    return value;
+                }
+                case 0x01:
+                    return ApplyTimerOutputs(ReadPort(PortBOutput, PortBDirection));
+                case 0x02:
+                    return PortADirection;
+                case 0x03:
+                    return PortBDirection;
+                default:
+                    return ReadRegister(address);
+            }
         }
 
         public void Poke(ushort address, byte value)
         {
             switch (address)
             {
-                case 0x04: timerAStartValue = ((timerAStartValue & 0xFF00) | value); break;
-                case 0x05: timerAStartValue = ((timerAStartValue & 0x00FF) | (value << 8)); break;
-                case 0x06: timerBStartValue = ((timerBStartValue & 0xFF00) | value); break;
-                case 0x07: timerBStartValue = ((timerBStartValue & 0x00FF) | (value << 8)); break;
-                case 0x08: timeTenthSecs = value; break;
-                case 0x09: timeSeconds = value; break;
-                case 0x0A: timeMinutes = value; break;
-                case 0x0B:
-                    timeHours = (byte)(value & 0x1F);
-                    timePM = ((value & 0x80) == 1);
+                case 0x00:
+                    PortAOutput = value;
+                    UpdateVideoBank();
+                    iec?.SetC64(PortAOutput, PortADirection);
                     break;
-                case 0x0D:
-                    bool fillBit = ((value & 0x80) != 0);
-                    if ((value & 1) != 0) timerAUnderflow = fillBit;
-                    if ((value & 2) != 0) timerBUnderflow = fillBit;
+
+                case 0x01:
+                    PortBOutput = value;
                     break;
-                case 0x0E:
-                    timerAEnabled = ((value & 0x1) != 0);
-                    timerAPortBUnderflow = ((value & 0x2) != 0);
-                    timerAPortBInvert = ((value & 0x4) == 0);
-                    timerARestart = ((value & 0x8) == 0);
-                    if ((value & 0x10) != 0) timerAValue = timerAStartValue;
+
+                case 0x02:
+                    PortADirection = value;
+                    UpdateVideoBank();
+                    iec?.SetC64(PortAOutput, PortADirection);
                     break;
-                case 0x0F:
-                    timerBEnabled = ((value & 0x1) != 0);
-                    timerBPortBUnderflow = ((value & 0x2) != 0);
-                    timerBPortBInvert = ((value & 0x4) == 0);
-                    timerBRestart = ((value & 0x8) == 0);
-                    if ((value & 0x10) != 0) timerBValue = timerBStartValue;
+
+                case 0x03:
+                    PortBDirection = value;
+                    break;
+
+                default:
+                    WriteRegister(address, value);
                     break;
             }
+        }
+
+        private void UpdateVideoBank()
+        {
+            // CIA2 port A bits 0-1 drive the VIC bank through an inverter. Input
+            // pins are pulled high, so the effective pin value is output for
+            // driven bits and 1 for input bits.
+            byte pins = (byte)((PortAOutput & PortADirection) | (~PortADirection & 0xFF));
+            videoBank.BankAddress = pins;
+        }
+
+        private static byte ReadPort(byte output, byte direction)
+        {
+            // Unconnected/open input pins are pulled high on the CIA.
+            const byte inputPins = 0xFF;
+
+            return (byte)((output & direction) | (inputPins & ~direction));
         }
     }
 }

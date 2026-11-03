@@ -1,9 +1,11 @@
-﻿using System;
+using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
-using System.Text;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
-using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace C64Emulator
 {
@@ -19,41 +21,38 @@ namespace C64Emulator
         Disconnect = 7
     }
 
-    public delegate void IncomingConnection(object sender, EventArgs e);
-    public delegate void ReceivedCommand(object sender, NetCommands cmd, byte[] data);
-    public delegate void Connected(object sender, EventArgs e);
-    public delegate void ConnectFailed(object sender, Exception e);
-    public delegate void Disconnected(object sender, EventArgs e);
-    public delegate void DataSent(object sender, EventArgs e);
-
-    public class Socket
+    /// <summary>
+    /// Length-prefixed TCP transport shared by host and client. Framing is
+    /// intentionally small: one command byte, a 32-bit little-endian payload
+    /// length, then the payload.
+    /// </summary>
+    internal sealed class Socket
     {
-        public event IncomingConnection incomingConnection;
-        public event Connected connected;
-        public event ConnectFailed connectFailed;
-        public event DataSent dataSent;
-        public event ReceivedCommand receivedCommand;
-        public event Disconnected disconnected;
+        private const int MaximumFrameSize = 1024 * 1024;
+        private const int ReceiveBufferSize = 8192;
 
-        private TcpListener server;
-        private List<Client> clients;
+        private readonly object clientsLock = new object();
+        private readonly List<Client> clients = new List<Client>();
 
-        private bool listening = false;
+        private TcpListener? listener;
+        private CancellationTokenSource? listenCancellation;
 
-        public Socket()
-        {
-            clients = new List<Client>();
-        }
+        public event Action? IncomingConnection;
 
-        public List<Client> Clients
+        public event Action<NetCommands, byte[]>? ReceivedCommand;
+
+        public event Action? Connected;
+
+        public event Action<Exception>? ConnectFailed;
+
+        public event Action? Disconnected;
+
+        public int ClientCount
         {
             get
             {
-                return clients;
-            }
-            set
-            {
-                clients = value;
+                lock (clientsLock)
+                    return clients.Count;
             }
         }
 
@@ -61,307 +60,272 @@ namespace C64Emulator
         {
             DisconnectAll();
 
-            server = new TcpListener(IPAddress.Any, port);
-            server.Start();
-            listening = true;
-            server.BeginAcceptTcpClient(new AsyncCallback(AcceptConnection), server);
+            listenCancellation = new CancellationTokenSource();
+            listener = new TcpListener(IPAddress.Any, port);
+            listener.Start();
+
+            _ = AcceptLoopAsync(listener, listenCancellation.Token);
         }
 
         public void StopListening()
         {
-            listening = false;
-            try
-            {
-                server.Stop();
-            }
-            catch { }
-        }
+            CancellationTokenSource? cancellation = listenCancellation;
+            listenCancellation = null;
 
-        private void AcceptConnection(IAsyncResult iar)
-        {
-            if (!listening) return;
-            TcpClient client = server.EndAcceptTcpClient(iar);
+            cancellation?.Cancel();
+            cancellation?.Dispose();
 
-            Client c = new Client();
-            c.TcpClient = client;
-
-            c.Data.BeginRead(
-                c.Buffer, 
-                0, 
-                c.Buffer.Length, 
-                new AsyncCallback(ReceiveData), 
-                c
-                );
-
-            clients.Add(c);
-
-            incomingConnection(c, null);
-
-            server.BeginAcceptTcpClient(new AsyncCallback(AcceptConnection), server);
+            listener?.Stop();
+            listener = null;
         }
 
         public void DisconnectAll()
         {
-            foreach (Client c in clients)
-            {
-                if (c.TcpClient.Connected)
-                    c.TcpClient.Close();
-            }
-            
-            clients.Clear();
-        }
+            Client[] snapshot;
 
-        private void ReceiveData(IAsyncResult iar)
-        {
-            Client c = (Client)iar.AsyncState;
-            if (!clients.Contains(c) || !c.TcpClient.Connected) return;
-
-            if (c.Data == null) return;
-            int length = c.Data.EndRead(iar);
-            c.Memory.Write(c.Buffer, 0, length);
-            c.EmptyBuffer();
-
-            if (c.CurrentCommand == NetCommands.Disconnect)
+            lock (clientsLock)
             {
-                c.TcpClient.Close();
-                clients.Remove(c);
-                disconnected(c, null);
-                return;
-            }
-            else
-            {
-                while (c.CurrentLength == 0 || c.CurrentData.Length > 0)
-                {
-                    receivedCommand(c, c.CurrentCommand, c.CurrentData);
-                    c.EmptyMemory(c.CurrentLength + 5);
-                }
+                snapshot = clients.ToArray();
+                clients.Clear();
             }
 
-            if (c.Data != null)
-                c.Data.BeginRead(
-                    c.Buffer,
-                    0,
-                    c.Buffer.Length,
-                    new AsyncCallback(ReceiveData),
-                    c
-                    );
+            foreach (Client client in snapshot)
+                CloseClient(client);
         }
 
         public void Connect(string server, int port)
         {
-            Client c = new Client();
-            clients.Add(c);
-            c.TcpClient.BeginConnect(server, port, new AsyncCallback(DoConnect), c);
-        }
-
-        private void DoConnect(IAsyncResult iar)
-        {
-            Client c = (Client)iar.AsyncState;
-
-            try
-            {
-                c.TcpClient.EndConnect(iar);
-            }
-            catch (Exception ex)
-            {
-                clients.Remove(c);
-                connectFailed(c, ex);
-                return;
-            }
-           
-            c.Data.BeginRead(
-                c.Buffer,
-                0,
-                c.Buffer.Length,
-                new AsyncCallback(ReceiveData),
-                c
-                );
-
-            connected(c, null);
-        }
-
-        public void Send(Client c, byte[] data)
-        {
-            if (!clients.Contains(c) || !c.TcpClient.Connected) return;
-
-            c.Data.BeginWrite(
-                data,
-                0,
-                data.Length,
-                new AsyncCallback(SendData),
-                c
-                );
+            _ = ConnectAsync(server, port);
         }
 
         public void SendToAll(byte[] data)
         {
-            foreach (Client c in clients)
-            {
-                if (c.TcpClient.Connected)
-                    c.Data.BeginWrite(
-                        data,
-                        0,
-                        data.Length,
-                        new AsyncCallback(SendData),
-                        c
-                        );
-            }
+            Client[] snapshot;
+
+            lock (clientsLock)
+                snapshot = clients.ToArray();
+
+            foreach (Client client in snapshot)
+                _ = SendAsync(client, data);
         }
 
-        private void SendData(IAsyncResult iar)
+        private async Task AcceptLoopAsync(
+            TcpListener activeListener,
+            CancellationToken cancellationToken)
         {
-            Client c = (Client)iar.AsyncState;
-            if (!clients.Contains(c) || !c.TcpClient.Connected) return;
-
-            if (c.Data != null)
+            while (!cancellationToken.IsCancellationRequested)
             {
-                c.Data.EndWrite(iar);
+                TcpClient tcpClient;
 
-                dataSent(c, null);
-            }
-        }
-    }
-
-    public class Client
-    {
-        public const int BUFFER_SIZE = 5120;
-
-        private TcpClient client;
-        private byte[] buffer;
-        private MemoryStream ms;
-
-        public Client()
-        {
-            client = new TcpClient();
-            buffer = new byte[BUFFER_SIZE];
-            ms = new MemoryStream();
-        }
-
-        public TcpClient TcpClient
-        {
-            get
-            {
-                return client;
-            }
-            set
-            {
-                client = value;
-            }
-        }
-
-        public byte[] Buffer
-        {
-            get
-            {
-                return buffer;
-            }
-            set
-            {
-                buffer = value;
-            }
-        }
-
-        public NetworkStream Data
-        {
-            get
-            {
                 try
                 {
-                    return client.GetStream();
+                    tcpClient = await activeListener.AcceptTcpClientAsync(cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return;
+                }
+                catch (SocketException)
+                {
+                    return;
+                }
+
+                AddClient(tcpClient);
+                IncomingConnection?.Invoke();
+            }
+        }
+
+        private async Task ConnectAsync(string server, int port)
+        {
+            TcpClient tcpClient = new TcpClient();
+
+            try
+            {
+                await tcpClient.ConnectAsync(server, port);
+            }
+            catch (Exception ex)
+            {
+                tcpClient.Dispose();
+                ConnectFailed?.Invoke(ex);
+                return;
+            }
+
+            AddClient(tcpClient);
+            Connected?.Invoke();
+        }
+
+        private void AddClient(TcpClient tcpClient)
+        {
+            Client client = new Client(tcpClient);
+
+            lock (clientsLock)
+                clients.Add(client);
+
+            _ = ReceiveLoopAsync(client);
+        }
+
+        private async Task ReceiveLoopAsync(Client client)
+        {
+            byte[] buffer = new byte[ReceiveBufferSize];
+
+            try
+            {
+                while (!client.Cancellation.IsCancellationRequested)
+                {
+                    int length = await client.Stream.ReadAsync(
+                        buffer.AsMemory(0, buffer.Length),
+                        client.Cancellation.Token);
+
+                    if (length == 0)
+                        break;
+
+                    client.Buffer.Write(buffer, 0, length);
+
+                    if (!ParseFrames(client))
+                        break;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            catch (IOException)
+            {
+            }
+            catch (SocketException)
+            {
+            }
+            finally
+            {
+                RemoveClient(client, true);
+            }
+        }
+
+        private bool ParseFrames(Client client)
+        {
+            while (client.Buffer.Length >= 5)
+            {
+                byte[] data = client.Buffer.GetBuffer();
+                NetCommands command = (NetCommands)data[0];
+                int length = BinaryPrimitives.ReadInt32LittleEndian(
+                    new ReadOnlySpan<byte>(data, 1, 4));
+
+                if (length < 0 || length > MaximumFrameSize)
+                    return false;
+
+                if (client.Buffer.Length < length + 5)
+                    return true;
+
+                if (command == NetCommands.Disconnect)
+                    return false;
+
+                byte[] payload = new byte[length];
+
+                if (length > 0)
+                    Buffer.BlockCopy(data, 5, payload, 0, length);
+
+                int remaining = (int)client.Buffer.Length - length - 5;
+
+                if (remaining > 0)
+                    Buffer.BlockCopy(data, length + 5, data, 0, remaining);
+
+                client.Buffer.SetLength(remaining);
+
+                try
+                {
+                    ReceivedCommand?.Invoke(command, payload);
                 }
                 catch
                 {
-                    return null;
+                    return false;
                 }
             }
+
+            return true;
         }
 
-        public MemoryStream Memory
+        private async Task SendAsync(Client client, byte[] data)
         {
-            get
+            try
             {
-                return ms;
-            }
-        }
+                await client.SendLock.WaitAsync(client.Cancellation.Token);
 
-        public NetCommands CurrentCommand
-        {
-            get
-            {
-                if (ms.Length > 0)
+                try
                 {
-                    ms.Seek(0, SeekOrigin.Begin);
-                    BinaryReader br = new BinaryReader(ms);
-                    byte ret = br.ReadByte();
-                    ms.Seek(0, SeekOrigin.End);
-
-                    return (NetCommands)ret;
+                    await client.Stream.WriteAsync(
+                        data.AsMemory(0, data.Length),
+                        client.Cancellation.Token);
                 }
-                else
-                    return NetCommands.None;
-            }
-        }
-
-        public int CurrentLength
-        {
-            get
-            {
-                if (ms.Length > 4)
+                finally
                 {
-                    ms.Seek(1, SeekOrigin.Begin);
-                    BinaryReader br = new BinaryReader(ms);
-                    int ret = br.ReadInt32();
-                    ms.Seek(0, SeekOrigin.End);
-
-                    return ret;
+                    client.SendLock.Release();
                 }
-                else
-                    return -1;
             }
-        }
-
-        public byte[] CurrentData
-        {
-            get
+            catch (OperationCanceledException)
             {
-
-                if (CurrentLength > -1)
-                {
-                    int length = CurrentLength;
-
-                    if (ms.Length > length + 4)
-                    {
-                        ms.Seek(5, SeekOrigin.Begin);
-                        byte[] ret = new byte[length];
-                        ms.Read(ret, 0, ret.Length);
-                        ms.Seek(0, SeekOrigin.End);
-
-                        return ret;
-                    }
-                    else
-                        return new byte[0];
-                }
-                else
-                    return new byte[0];
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            catch (IOException)
+            {
+                RemoveClient(client, true);
+            }
+            catch (SocketException)
+            {
+                RemoveClient(client, true);
             }
         }
 
-        public void EmptyBuffer()
+        private void RemoveClient(Client client, bool notify)
         {
-            buffer = new byte[BUFFER_SIZE];
+            bool removed;
+
+            lock (clientsLock)
+                removed = clients.Remove(client);
+
+            CloseClient(client);
+
+            if (removed && notify)
+                Disconnected?.Invoke();
         }
 
-        public void EmptyMemory(int length)
+        private static void CloseClient(Client client)
         {
-            MemoryStream newms = new MemoryStream();
+            try
+            {
+                client.Cancellation.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
 
-            if (length > (int)ms.Length)
-                length = (int)ms.Length;
-            else if (length < (int)ms.Length)
-                newms.Write(ms.ToArray(), length, (int)ms.Length - length);
-
-            ms.Dispose();
-            ms = newms;
+            client.TcpClient.Close();
         }
+    }
+
+    internal sealed class Client
+    {
+        public Client(TcpClient tcpClient)
+        {
+            TcpClient = tcpClient;
+            Stream = tcpClient.GetStream();
+        }
+
+        public TcpClient TcpClient { get; }
+
+        public NetworkStream Stream { get; }
+
+        public MemoryStream Buffer { get; } = new MemoryStream();
+
+        public SemaphoreSlim SendLock { get; } = new SemaphoreSlim(1, 1);
+
+        public CancellationTokenSource Cancellation { get; } = new CancellationTokenSource();
     }
 }

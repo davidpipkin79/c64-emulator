@@ -1,120 +1,147 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
+using System;
 
 namespace C64Emulator
 {
-    public enum Caller
+    /// <summary>
+    /// The 64 KB address space and the PLA memory configuration. RAM is always
+    /// present underneath the ROM and I/O overlays, which matters for writes
+    /// while a ROM is banked in.
+    /// </summary>
+    internal sealed class Memory : IMemoryBus, IVideoBus
     {
-        CPU,
-        VIC
-    }
+        private readonly byte[] ram = new byte[AddressMap.RamSize];
 
-    class Memory
-    {
-        private const int MEMORY_SIZE = 0x10000; //64 KB
+        private RomSet? roms;
+        private IIoPort? io;
+        private Cartridge? cartridge;
 
-        private readonly byte[] ram = new byte[MEMORY_SIZE];
-
-        private ushort activeVICVMStart;
-        private ushort activeVICVMEnd;
-        private ushort activeVICPMStart;
-        private ushort activeVICPMEnd;
         private bool loram;
         private bool hiram;
         private bool charen;
 
         public Memory()
         {
-            ram[0] = 0xEF;
-            ram[1] = 0x07;
-            getDirectionRegs();
+            ResetProcessorPort();
         }
 
-        public void setActiveVICVM(ushort start, ushort end)
+        public int Size => ram.Length;
+
+        private bool IoVisible => (hiram || loram) && charen;
+
+        private bool CharacterRomVisible => (hiram || loram) && !charen;
+
+        public bool IsKernalVisible => hiram;
+
+        public Cartridge? Cartridge => cartridge;
+
+        public void AttachCartridge(Cartridge? cart)
         {
-            activeVICVMStart = start;
-            activeVICVMEnd = end;
+            cartridge = cart;
         }
 
-        public void setActiveVICPM(ushort start, ushort end)
+        public void Configure(RomSet romSet, IIoPort ioPort)
         {
-            activeVICPMStart = start;
-            activeVICPMEnd = end;
+            roms = romSet ?? throw new ArgumentNullException(nameof(romSet));
+            io = ioPort ?? throw new ArgumentNullException(nameof(ioPort));
+            UpdateMemoryConfiguration();
         }
 
-        public int Size
+        /// <summary>
+        /// Power-on state of the 6510 processor port. The KERNAL expects the
+        /// I/O area and both ROMs to be visible immediately after reset.
+        /// </summary>
+        public void ResetProcessorPort()
         {
-            get
-            {
-                return MEMORY_SIZE;
-            }
-        }
-
-        private void getDirectionRegs()
-        {
-            loram = ((ram[0] & ram[1] & 1) != 0);
-            hiram = ((ram[0] & ram[1] & 2) != 0);
-            charen = ((ram[0] & ram[1] & 4) != 0);
+            ram[AddressMap.ProcessorPortDirection] = 0xEF;
+            ram[AddressMap.ProcessorPort] = 0x07;
+            UpdateMemoryConfiguration();
         }
 
         public void Poke(ushort address, byte value)
         {
-            //ram[address] = value;
-
-            if (
-                (hiram || loram) &&
-                address >= C64.io.Position &&
-                address < C64.io.Position + C64.io.Size
-                )
-                C64.io.Poke((ushort)(address - C64.io.Position), value);
+            if (IoVisible && address is >= AddressMap.IoStart and < AddressMap.IoEnd)
+            {
+                io?.Poke((ushort)(address - AddressMap.IoStart), value);
+            }
             else
+            {
                 ram[address] = value;
+            }
 
-            if (address < 2)
-                getDirectionRegs();
+            if (address <= AddressMap.ProcessorPort)
+                UpdateMemoryConfiguration();
         }
 
         public byte Peek(ushort address)
         {
-            if (hiram && address >= C64.kernal.Position)
+            // Standard cartridges drive ROML (and ROMH for 16K images) onto
+            // the bus regardless of the processor port. Writes still land in
+            // the underlying RAM so a cartridge can be removed cleanly.
+            if (cartridge is not null && cartridge.TryRead(address, out byte cartridgeValue))
+                return cartridgeValue;
+
+            if (roms is not null)
             {
-                return C64.kernal.Peek((ushort)(address - C64.kernal.Position));
+                if (hiram && address >= AddressMap.KernalRomStart)
+                    return roms.Kernal[address - AddressMap.KernalRomStart];
+
+                // LORAM alone controls the BASIC overlay; HIRAM controls the
+                // KERNAL overlay. Keeping these independent fixes the
+                // HIRAM=0, LORAM=1 PLA configuration.
+                if (
+                    loram &&
+                    address >= AddressMap.BasicRomStart &&
+                    address < AddressMap.BasicRomStart + AddressMap.BasicRomSize)
+                {
+                    return roms.Basic[address - AddressMap.BasicRomStart];
+                }
+
+                if (
+                    CharacterRomVisible &&
+                    address >= AddressMap.CharacterRomStart &&
+                    address < AddressMap.CharacterRomStart + AddressMap.CharacterRomSize)
+                {
+                    return roms.Character[address - AddressMap.CharacterRomStart];
+                }
             }
-            else if (hiram && loram &&
-                address >= C64.basic.Position &&
-                address < C64.basic.Position + C64.basic.Size)
-            {
-                return C64.basic.Peek((ushort)(address - C64.basic.Position));
-            }
-            else if ((hiram || loram) && !charen &&
-                address >= C64.charset.Position1 &&
-                address < C64.charset.Position1 + C64.charset.Size)
-            {
-                return C64.charset.Peek((ushort)(address - C64.charset.Position1));
-            }
-            else if ((hiram || loram) && charen &&
-                address >= C64.io.Position &&
-                address < C64.io.Position + C64.io.Size)
-            {
-                return C64.io.Peek((ushort)(address - C64.io.Position));
-            }
-            else
-                return ram[address];
+
+            if (IoVisible && address is >= AddressMap.IoStart and < AddressMap.IoEnd)
+                return io?.Peek((ushort)(address - AddressMap.IoStart)) ?? 0xFF;
+
+            return ram[address];
         }
 
         public ushort PeekWord(ushort address)
         {
-            return
-                (ushort)
-                (((ushort)(Peek((ushort)(address + 1))) << 8) |
-                (ushort)(Peek(address)));
+            return (ushort)(Peek(address) | (Peek((ushort)(address + 1)) << 8));
         }
 
-        public byte VICPeek(ushort address)
+        /// <summary>
+        /// The VIC sees RAM and the character ROM overlay at $1000-$1FFF and
+        /// $9000-$9FFF. It does not see the KERNAL/BASIC ROMs or I/O.
+        /// </summary>
+        public byte Read(ushort address)
         {
+            if (roms is not null)
+            {
+                if (address is >= 0x1000 and < 0x2000)
+                    return roms.Character[address - 0x1000];
+
+                if (address is >= 0x9000 and < 0xA000)
+                    return roms.Character[address - 0x9000];
+            }
+
             return ram[address];
         }
 
+        private void UpdateMemoryConfiguration()
+        {
+            byte direction = ram[AddressMap.ProcessorPortDirection];
+            byte output = ram[AddressMap.ProcessorPort];
+
+            loram = (direction & output & 0x01) != 0;
+            hiram = (direction & output & 0x02) != 0;
+            charen = (direction & output & 0x04) != 0;
+        }
     }
 }

@@ -1,13 +1,8 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Threading;
-using System.Drawing;
+using System;
 
 namespace C64Emulator
 {
-    // Enumeration of VIC Video Modes
-    public enum VideoMode : byte
+    internal enum VideoMode : byte
     {
         SimpleCharacterMode = 0x00,
         MultiColorCharacterMode = 0x10,
@@ -16,376 +11,380 @@ namespace C64Emulator
         ExtendedColorCharacterMode = 0x40
     }
 
-    // Structure for a VIC Sprite
-    public struct Sprite
+    internal struct Sprite
     {
         public int X;
         public int Y;
         public bool Enabled;
         public int Width;
         public int Height;
+        public int PixelScale;
         public bool MulticolorMode;
+        public bool DoubleWidth;
         public bool TopMost;
-        public Color SpriteColor;
+        public RgbColor SpriteColor;
     }
 
-    // Structure for a VIC Pixel
-    public struct Pixel
+    internal struct Pixel
     {
-        public Color PixelColor;
+        public RgbColor PixelColor;
         public bool Background;
     }
 
-    class VIC
+    /// <summary>
+    /// A scanline-oriented VIC-II model. One CPU cycle advances the video
+    /// pipeline by eight pixels, matching the PAL VIC's 8 MHz dot clock. The
+    /// renderer receives a completed frame through a double buffer, so the CPU
+    /// thread never hands out an array it is still drawing into.
+    /// </summary>
+    internal sealed class VIC : IVideoBank
     {
-        // Memory Constants
-        private const ushort REGISTERS_POS = 0xD000;
-        private const int NUM_REGISTERS = 47;
-        private const ushort BANKADDRESS_POS = 0xDD00;
-        private const ushort CHAR_POS1 = 0x1000;
-        private const ushort CHAR_POS2 = 0x9000;
-        private const ushort COLORMATRIXADDRESS = 0xD800;
-        
-        // Screen Constants (PAL)
-		private const int FULLSCREENWIDTH = 504;        // Includes HBLANK area
-		private const int FULLSCREENHEIGHT = 312;       // Includes VBLANK area
-		private const int VISIBLESCREENWIDTH = 403;     // Includes Border area
-		private const int VISIBLESCREENHEIGHT = 284;    // Includes Border area
-        private const int FIRSTRASTERLINE = 9;
-        private const int LASTRASTERLINE = 293;
-        private const int FIRSTLINEPIXEL = 0; //76;
-        private const int LASTLINEPIXEL = 403; //479;
-        private const int FIRSTSCREENLINE = 51;
-        private const int LASTSCREENLINE = 250;
-        private const int FIRSTSCREENPIXEL = 44; //120;
-        private const int LASTSCREENPIXEL = 363; //439;
-        private const int SPRITEXCOORD = 24;            // Sprite X-Coordinate for position (0,0)
-        private const int SPRITEYCOORD = 50;            // Sprite Y-Coordinate for position (0,0)
+        public const int RegisterCount = 47;
+        public const int CyclesPerLine = 63;
+        public const int RasterLines = 312;
+        public const int CyclesPerFrame = CyclesPerLine * RasterLines;
 
-        private ushort bankAddress;                     // Selected VIC bank address in memory
-        private ushort videoMatrixAddress;              // Screen address in selected bank
-        private ushort pixelMatrixAddress;              // Character address in selected bank
+        // PAL 6569: line 0 is one cycle short and the last line is one cycle
+        // long. The frame still totals 19656 cycles.
+        private const int FirstLineCycles = 62;
+        private const int LastLineCycles = 64;
+        private const int PixelsPerCycle = 8;
+
+        public const int VisibleWidth = 403;        // including border
+        public const int VisibleHeight = 284;       // including border
+
+        private const int FirstRasterLine = 9;
+        private const int LastRasterLine = 293;
+        private const int FirstLinePixel = 76;
+        private const int FirstDisplayLine = 48;
+        private const int FirstScreenLine = 51;
+        private const int LastScreenLine = 250;
+        private const int FirstScreenPixel = 44;
+        private const int LastScreenPixel = 363;
+        private const int SpriteXOrigin = 20;
+        private const int SpriteYOrigin = 1;
+
+        private readonly IVideoBus bus;
+        private readonly ColorRam colorRam;
+        private readonly InterruptLine interrupts;
+        private readonly byte[] registers = new byte[RegisterCount];
+        private readonly Sprite[] sprites = new Sprite[8];
+        private readonly object screenLock = new object();
+        private readonly Pixel emptyPixel;
+        private volatile bool renderPixels = true;
+        private bool frameRendered;
+
+        // A badline fetches one complete 40-byte video-matrix row and its
+        // matching Color RAM nibbles. The display pipeline then reuses those
+        // latches until the next badline, so writes to screen or color RAM do
+        // not retroactively change cells the VIC already fetched.
+        private readonly byte[] matrixRow = new byte[40];
+        private readonly byte[] colorRow = new byte[40];
+        private readonly byte[] glyphRow = new byte[40];
+        private readonly bool[] spriteDmaActive = new bool[8];
+        private readonly int[] spriteDmaRemaining = new int[8];
+        private int matrixRowStart;
+        private int videoCounterBase;
+        private bool denLatched;
+        private bool lineIsBadline;
+        private bool previousLineWasBadline;
+        private int rowCounter;
+        private int stolenCycles;
+
+        private RgbColor[,] frontBuffer = new RgbColor[VisibleWidth, VisibleHeight];
+        private RgbColor[,] backBuffer = new RgbColor[VisibleWidth, VisibleHeight];
+
+        private ushort bankAddress;
+        private ushort videoMatrixAddress;
+        private ushort pixelMatrixAddress;
 
         private VideoMode currentVideoMode;
         private bool bitmapMode;
-        private int rasterIntLine = 0;
-        private bool rasterIntEnabled = false;
-        private bool spriteBGCollide = false;
-        private bool spriteSpriteCollide = false;
-        private byte lightPenX = 0;
-        private byte lightPenY = 0;
-        private bool lightPenIntEnabled = false;
-        private bool screenEnabled = true;
-        private byte horizontalScroll = 0;
-        private byte verticalScroll = 0;
+        private int rasterIntLine;
+        private bool rasterIntEnabled;
+        private bool spriteBackgroundCollide;
+        private bool spriteSpriteCollide;
+        private bool screenEnabled;
+        private byte horizontalScroll;
+        private byte verticalScroll;
         private byte textRows = 25;
-        private byte textCols = 40;
-        private int firstScreenPixel = FIRSTSCREENPIXEL;
-        private int lastScreenPixel = LASTSCREENPIXEL;
-        private int firstScreenLine = FIRSTSCREENLINE;
-        private int lastScreenLine = LASTSCREENLINE;
+        private byte textColumns = 40;
+        private int firstScreenPixel = FirstScreenPixel;
+        private int lastScreenPixel = LastScreenPixel;
+        private int firstScreenLine = FirstScreenLine;
+        private int lastScreenLine = LastScreenLine;
 
-        private Sprite[] sprites;
+        private int currentCycle;
+        private int currentHLine;
+        private int rasterIrqCountdown;
 
-        private Pixel emptyPixel;
-
-        private byte[] register;
-
-        private Color[,] activeScreen;
-		private byte[] serializedScreen;
-        private int currentVLine = 0;
-        private int currentHLine = 0;
-
-        public VIC()
+        public VIC(IVideoBus bus, ColorRam colorRam, InterruptLine interrupts)
         {
-            register = new byte[NUM_REGISTERS];
-            activeScreen = new Color[VISIBLESCREENWIDTH, VISIBLESCREENHEIGHT];
-            serializedScreen = new byte[VISIBLESCREENWIDTH * VISIBLESCREENHEIGHT / 2];
+            this.bus = bus ?? throw new ArgumentNullException(nameof(bus));
+            this.colorRam = colorRam ?? throw new ArgumentNullException(nameof(colorRam));
+            this.interrupts = interrupts ?? throw new ArgumentNullException(nameof(interrupts));
+
+            emptyPixel.Background = true;
+            emptyPixel.PixelColor = C64Palette.Get(0);
+
+            Reset();
+        }
+
+        public void Reset()
+        {
+            Array.Clear(registers);
+            Array.Clear(frontBuffer);
+            Array.Clear(backBuffer);
+
+            for (int i = 0; i < sprites.Length; i++)
+            {
+                sprites[i] = new Sprite
+                {
+                    X = 0,
+                    Y = 0,
+                    Width = 24,
+                    Height = 21,
+                    PixelScale = 1,
+                    Enabled = false,
+                    MulticolorMode = false,
+                    DoubleWidth = false,
+                    TopMost = true,
+                    SpriteColor = C64Palette.Get(0)
+                };
+            }
+
+            bankAddress = 0xC000; // power-on VIC bank 0
+            rasterIntLine = 0;
+            rasterIntEnabled = false;
+            spriteBackgroundCollide = false;
+            spriteSpriteCollide = false;
+            screenEnabled = true;
+            horizontalScroll = 0;
+            verticalScroll = 0;
+            textRows = 25;
+            textColumns = 40;
+            firstScreenPixel = FirstScreenPixel;
+            lastScreenPixel = LastScreenPixel;
+            firstScreenLine = FirstScreenLine;
+            lastScreenLine = LastScreenLine;
+            currentCycle = 0;
+            currentHLine = 0;
+            rasterIrqCountdown = 0;
+            renderPixels = true;
+            frameRendered = false;
+            lineIsBadline = false;
+            previousLineWasBadline = false;
+            rowCounter = 0;
+            stolenCycles = 0;
             currentVideoMode = VideoMode.SimpleCharacterMode;
             bitmapMode = false;
-            sprites = new Sprite[8];
-            
-            emptyPixel = new Pixel();
-            emptyPixel.Background = true;
-            emptyPixel.PixelColor = Color.Black;
+            Array.Clear(matrixRow);
+            Array.Clear(colorRow);
+            Array.Clear(glyphRow);
+            Array.Clear(spriteDmaActive);
+            Array.Clear(spriteDmaRemaining);
+            matrixRowStart = 0;
+            videoCounterBase = 0;
+            denLatched = false;
 
-            for (int i = 0; i < 8; i++)
-            {
-                sprites[i].X = 0;
-                sprites[i].Y = 0;
-                sprites[i].Width = 24;
-                sprites[i].Height = 21;
-                sprites[i].Enabled = false;
-                sprites[i].MulticolorMode = false;
-                sprites[i].SpriteColor = Color.Black;
-                sprites[i].TopMost = true;
-            }
+            UpdateVideoMatrixAddress();
+            UpdatePixelMatrixAddress();
+            interrupts.Set(InterruptSource.Vic, false);
         }
 
-        public int BorderWidth
-        {
-            get
-            {
-                return FIRSTSCREENPIXEL - FIRSTLINEPIXEL;
-            }
-        }
-
-        public int BorderHeight
-        {
-            get
-            {
-                return FIRSTSCREENLINE - FIRSTRASTERLINE;
-            }
-        }
-
-        public Color BorderColor
-        {
-            get
-            {
-                return C64.palette.MapColorValue(register[0x20]);
-            }
-        }
-
-        public Color[,] Screen
-        {
-            get
-            {
-                return activeScreen;
-            }
-        }
-
-        public byte HorizontalScroll
-        {
-            get
-            {
-                return horizontalScroll;
-            }
-        }
-
-        public byte VerticalScroll
-        {
-            get
-            {
-                return verticalScroll;
-            }
-        }
-
-        public void UpdateActiveScreen(int cycles)
-        {
-            for (int i = 0; i < cycles; i++)
-            {
-                if (
-                    currentHLine >= FIRSTRASTERLINE && 
-                    currentHLine < LASTRASTERLINE && 
-                    currentVLine > FIRSTLINEPIXEL - 8 &&
-                    currentVLine < LASTLINEPIXEL
-                    )
-                    for (int x = currentVLine; x < currentVLine + 8; x++)
-                    {
-                        if (x >= FIRSTLINEPIXEL && x < LASTLINEPIXEL)
-                        {
-                            if (
-                                !screenEnabled ||
-                                currentHLine < firstScreenLine ||
-                                currentHLine > lastScreenLine ||
-                                x < firstScreenPixel ||
-                                x > lastScreenPixel
-                                )
-                            {
-                                activeScreen[x - FIRSTLINEPIXEL, currentHLine - FIRSTRASTERLINE] =
-                                    C64.palette.MapColorValue(register[0x20]);
-                            }
-                            else
-                            {
-                                int scrolledX = x - horizontalScroll;
-                                int scrolledY = (byte)(currentHLine - (verticalScroll - 3)); ;
-
-                                if (
-                                    scrolledX < FIRSTSCREENPIXEL || scrolledX > LASTSCREENPIXEL ||
-                                    scrolledY < FIRSTSCREENLINE || scrolledY > LASTSCREENLINE)
-                                {
-                                    activeScreen[x - FIRSTLINEPIXEL, currentHLine - FIRSTRASTERLINE] = Color.Black;
-                                }
-                                else
-                                {
-                                    Pixel pixel = getPixel(scrolledX - FIRSTSCREENPIXEL, scrolledY - FIRSTSCREENLINE);
-                                    int pixelSet = -1;
-                                    bool pixelDrawn = false;
-
-                                    for (int sprite = 0; sprite < 8; sprite++)
-                                        if (sprites[sprite].Enabled)
-                                        {
-                                            Pixel spritePixel =
-                                                getSpritePixel(
-                                                    sprite,
-                                                    x - FIRSTSCREENPIXEL + SPRITEXCOORD,
-                                                    currentHLine - FIRSTSCREENLINE + SPRITEYCOORD
-                                                    );
-
-                                            if (!spritePixel.Background)
-                                            {
-                                                if (pixelSet > -1)
-                                                {
-                                                    if (spriteSpriteCollide)
-                                                    {
-                                                        register[0x19] |= 0x84;
-                                                        C64.cpu.IRQ();
-                                                    }
-                                                    register[0x1E] |= (byte)((1 << sprite) | (1 << pixelSet));
-                                                }
-                                                if (!pixel.Background)
-                                                {
-                                                    if (spriteBGCollide)
-                                                    {
-                                                        register[0x19] |= 0x82;
-                                                        C64.cpu.IRQ();
-                                                    }
-                                                    register[0x1F] |= (byte)((1 << sprite));
-                                                }
-
-                                                if (!pixelDrawn && (sprites[sprite].TopMost || pixel.Background))
-                                                {
-                                                    activeScreen[x - FIRSTLINEPIXEL, currentHLine - FIRSTRASTERLINE] =
-                                                        spritePixel.PixelColor;
-
-                                                    pixelDrawn = true;
-                                                }
-
-                                                pixelSet = sprite;
-                                            }
-                                        }
-
-                                    if (!pixelDrawn)
-                                        activeScreen[x - FIRSTLINEPIXEL, currentHLine - FIRSTRASTERLINE] = pixel.PixelColor;
-                                }
-                            }
-
-                            if (C64.network.IsHosting && C64.network.HostNumClients > 0)
-                            {
-                                int currentPos =
-                                    (currentHLine - FIRSTRASTERLINE) * VISIBLESCREENWIDTH +
-                                    (x - FIRSTLINEPIXEL);
-
-                                serializedScreen[currentPos / 2] =
-                                    (byte)(
-                                    (
-                                        serializedScreen[currentPos / 2] & 
-                                        (0xF << ((currentPos % 2) * 4))
-                                    ) |
-                                    (
-                                        (C64.palette.MapColorToValue(
-                                            activeScreen[x - FIRSTLINEPIXEL, currentHLine - FIRSTRASTERLINE]
-                                        ) << ((1 - (currentPos % 2)) * 4))
-                                    ));
-                            }
-                        }
-                    }
-
-                currentVLine += 8;
-                if (currentVLine == FULLSCREENWIDTH)
-                {
-                    currentVLine = 0;
-                    currentHLine++;
-                    if (currentHLine == FULLSCREENHEIGHT)
-                    {
-                        currentHLine = 0;
-                        
-                        C64.renderer.Draw();
-                        
-                        if (
-                            C64.network.IsHosting &&
-                            C64.network.HostNumClients > 0 &&
-                            C64.network.ImageReady
-                            )
-                            C64.network.Send(NetCommands.Image, serializedScreen);
-                    }
-
-                    if (rasterIntEnabled && currentHLine == rasterIntLine)
-                    {
-                        register[0x19] |= 0x81;
-                        C64.cpu.IRQ();
-                    }
-                }
-            }
-        }
+        public int RegistersPosition => AddressMap.VicStart;
 
         public ushort BankAddress
         {
-            get
-            {
-                return bankAddress;
-            }
+            get => bankAddress;
             set
             {
-                bankAddress = (ushort)((~(value & 3)) * 0x4000);
-                updateVMAddress();
-                updatePMAddress();
+                // CIA2 port A bits 0-1 are inverted before reaching the VIC.
+                bankAddress = (ushort)((~value & 0x03) * 0x4000);
+                UpdateVideoMatrixAddress();
+                UpdatePixelMatrixAddress();
             }
         }
 
-        public VideoMode CurrentVideoMode
+        public VideoMode CurrentVideoMode => currentVideoMode;
+
+        public bool BitmapMode => bitmapMode;
+
+        public byte HorizontalScroll => horizontalScroll;
+
+        public byte VerticalScroll => verticalScroll;
+
+        public int RasterLine => currentHLine;
+
+        public int RasterCycle => currentCycle;
+
+        /// <summary>
+        /// When false, the VIC still advances raster, fetch, DMA, and interrupt
+        /// state, but leaves the last completed picture in the front buffer.
+        /// Used during warp to avoid redrawing every emulated frame.
+        /// </summary>
+        public bool RenderPixels
         {
-            get
+            get => renderPixels;
+            set => renderPixels = value;
+        }
+
+        /// <summary>
+        /// BA is asserted during VIC fetches and for three cycles before each
+        /// one. The 6510 may finish a write while BA is low, but it is halted
+        /// before its next read.
+        /// </summary>
+        public bool BaLow => IsBaLow(currentCycle);
+
+        /// <summary>
+        /// AEC is low only while the VIC owns the bus. Both CPU reads and
+        /// writes are blocked during those cycles.
+        /// </summary>
+        public bool AecLow => IsAecLow(currentCycle);
+
+        /// <summary>
+        /// Returns whether the 6510 may perform a bus access in the current
+        /// cycle. Writes are allowed during the BA lead-in; AEC blocks both.
+        /// </summary>
+        public bool IsCpuAccessAllowed(bool isWrite)
+        {
+            return !AecLow && (isWrite || !BaLow);
+        }
+
+        public void CopyScreenTo(RgbColor[,] destination)
+        {
+            ArgumentNullException.ThrowIfNull(destination);
+
+            if (
+                destination.GetLength(0) != VisibleWidth ||
+                destination.GetLength(1) != VisibleHeight)
             {
-                return currentVideoMode;
+                throw new ArgumentException("Destination must be 403 x 284.", nameof(destination));
             }
-        }
 
-        public bool BitmapMode
-        {
-            get
+            lock (screenLock)
             {
-                return bitmapMode;
+                Array.Copy(frontBuffer, destination, frontBuffer.Length);
             }
         }
 
-        public ushort BankAddressPosition
+        /// <summary>
+        /// Replaces the display with a frame received from a network host.
+        /// </summary>
+        public void SetScreen(RgbColor[,] screen)
         {
-            get
+            ArgumentNullException.ThrowIfNull(screen);
+
+            if (
+                screen.GetLength(0) != VisibleWidth ||
+                screen.GetLength(1) != VisibleHeight)
             {
-                return BANKADDRESS_POS;
+                throw new ArgumentException("Screen must be 403 x 284.", nameof(screen));
             }
-        }
 
-        public ushort CharacterPosition1
-        {
-            get
+            lock (screenLock)
             {
-                return CHAR_POS1;
+                frontBuffer = screen;
+                backBuffer = (RgbColor[,])screen.Clone();
             }
         }
 
-        public ushort CharacterPosition2
+        /// <summary>
+        /// Advances the video pipeline by the requested CPU cycles. Returns true
+        /// when a complete frame has been produced.
+        /// </summary>
+        public bool Tick(int cycles)
         {
-            get
+            bool frameCompleted = false;
+
+            for (int cycle = 0; cycle < cycles; cycle++)
             {
-                return CHAR_POS2;
+                AdvanceRasterInterrupt();
+                ProcessVideoCycle(currentCycle);
+
+                currentCycle++;
+
+                if (currentCycle >= GetLineCycles(currentHLine))
+                {
+                    currentCycle = 0;
+                    currentHLine++;
+
+                    if (currentHLine >= RasterLines)
+                    {
+                        currentHLine = 0;
+                        CompleteFrame();
+                        frameCompleted = true;
+                    }
+
+                    BeginRasterLine();
+                    ScheduleRasterInterrupt();
+                }
             }
+
+            return frameCompleted;
         }
 
-        public int RegistersPosition
+        /// <summary>
+        /// Returns and clears the CPU bus cycles the VIC took since the last
+        /// call. The machine uses this to advance the rest of the system while
+        /// the CPU is stalled by badline or sprite DMA.
+        /// </summary>
+        public int TakeStolenCycles()
         {
-            get
+            int taken = stolenCycles;
+            stolenCycles = 0;
+            return taken;
+        }
+
+        public byte GetRegister(int register)
+        {
+            switch (register)
             {
-                return REGISTERS_POS;
+                case 0x11:
+                    return (byte)(
+                        (registers[register] & 0x7F) |
+                        ((GetRasterLineForRead() & 0x100) >> 1));
+
+                case 0x12:
+                    return (byte)(GetRasterLineForRead() & 0xFF);
+
+                case 0x13:
+                case 0x14:
+                    // No light pen is connected.
+                    return 0;
+
+                case 0x16:
+                    return (byte)(registers[register] | 0xC0);
+
+                case 0x18:
+                    return (byte)(registers[register] | 0x01);
+
+                case 0x19:
+                    return (byte)(registers[register] | 0x70);
+
+                case 0x1A:
+                    return (byte)(registers[register] | 0xF0);
+
+                case 0x1E:
+                case 0x1F:
+                    byte collision = registers[register];
+                    registers[register] = 0;
+                    UpdateIrq();
+                    return collision;
+
+                case >= 0x20 and <= 0x2E:
+                    return (byte)(registers[register] | 0xF0);
+
+                default:
+                    return registers[register];
             }
         }
 
-        public byte Peek(ushort address)
+        public void SetRegister(int register, byte value)
         {
-            if (address >= CHAR_POS1 && address < CHAR_POS1 + C64.charset.Size)
-                return C64.charset.Peek((ushort)((address + 0xC000) - C64.charset.Position1));
-            else if (address >= CHAR_POS2 &&  address < CHAR_POS2 + C64.charset.Size)
-                return C64.charset.Peek((ushort)((address + 0x4000) - C64.charset.Position1));
-            else
-                return C64.ram.VICPeek(address);
-        }
+            registers[register] = value;
 
-        public void SetRegister(int regnum, byte value)
-        {
-            register[regnum] = value;
-
-            switch (regnum)
+            switch (register)
             {
                 case 0x00:
                 case 0x02:
@@ -395,8 +394,8 @@ namespace C64Emulator
                 case 0x0A:
                 case 0x0C:
                 case 0x0E:
-                    int xNum = regnum / 2;
-                    sprites[xNum].X = (sprites[xNum].X & 0x100) | value;
+                    int xSprite = register / 2;
+                    sprites[xSprite].X = (sprites[xSprite].X & 0x100) | value;
                     break;
 
                 case 0x01:
@@ -407,398 +406,883 @@ namespace C64Emulator
                 case 0x0B:
                 case 0x0D:
                 case 0x0F:
-                    int yNum = regnum / 2;
-                    sprites[yNum].Y = value;
+                    int ySprite = register / 2;
+                    sprites[ySprite].Y = value;
                     break;
 
                 case 0x10:
                     for (int i = 0; i < 8; i++)
-                        sprites[i].X = (sprites[i].X & 0xFF) | ((value & (1 << i)) << (8 - i));
+                    {
+                        sprites[i].X =
+                            (sprites[i].X & 0xFF) | ((value & (1 << i)) << (8 - i));
+                    }
                     break;
 
                 case 0x11:
-                    verticalScroll = (byte)(value & 0x7);
-                    textRows = (byte)((value & 8) != 0 ? 25 : 24);
-                    if (textRows == 24)
-                    {
-                        firstScreenLine = FIRSTSCREENLINE + 4;
-                        lastScreenLine = LASTSCREENLINE - 4;
-                    }
-                    else
-                    {
-                        firstScreenLine = FIRSTSCREENLINE;
-                        lastScreenLine = LASTSCREENLINE;
-                    }
-                    screenEnabled = ((value & 0x10) != 0);
+                    verticalScroll = (byte)(value & 0x07);
+                    textRows = (value & 0x08) != 0 ? (byte)25 : (byte)24;
+                    screenEnabled = (value & 0x10) != 0;
                     rasterIntLine = (rasterIntLine & 0xFF) | ((value & 0x80) << 1);
-                    currentVideoMode = (VideoMode)((value & 0x60) | ((byte)currentVideoMode & 0x10));
-                    bitmapMode = (((byte)currentVideoMode) & 0x20) != 0;
-                    updatePMAddress();
+                    UpdateVideoMode();
+                    UpdateScreenGeometry();
+                    UpdatePixelMatrixAddress();
+                    TryStartForcedBadline(value);
+                    CancelStaleRasterInterrupt();
+
                     break;
 
                 case 0x12:
                     rasterIntLine = (rasterIntLine & 0x100) | value;
+                    CancelStaleRasterInterrupt();
                     break;
 
                 case 0x15:
                     for (int i = 0; i < 8; i++)
-                        sprites[i].Enabled = ((value & (1 << i)) != 0);
+                        sprites[i].Enabled = (value & (1 << i)) != 0;
                     break;
 
                 case 0x16:
-                    horizontalScroll = (byte)(value & 0x7);
-                    textCols = (byte)((value & 8) != 0 ? 40 : 38);
-                    if (textCols == 38)
-                    {
-                        firstScreenPixel = FIRSTSCREENPIXEL + 7;
-                        lastScreenPixel = LASTSCREENPIXEL - 9;
-                    }
-                    else
-                    {
-                        firstScreenPixel = FIRSTSCREENPIXEL;
-                        lastScreenPixel = LASTSCREENPIXEL;
-                    }
-                    currentVideoMode = (VideoMode)(((byte)currentVideoMode & 0x60) | (value & 0x10));
-                    bitmapMode = (((byte)currentVideoMode) & 0x20) != 0;
-                    updatePMAddress();
+                    horizontalScroll = (byte)(value & 0x07);
+                    textColumns = (value & 0x08) != 0 ? (byte)40 : (byte)38;
+                    UpdateVideoMode();
+                    UpdateScreenGeometry();
                     break;
 
                 case 0x17:
                     for (int i = 0; i < 8; i++)
-                        if ((value & (1 << i)) != 0)
-                            sprites[i].Height = 42;
-                        else
-                            sprites[i].Height = 21;
+                        sprites[i].Height = (value & (1 << i)) != 0 ? 42 : 21;
                     break;
 
                 case 0x18:
-                    updateVMAddress();
-                    updatePMAddress();
+                    UpdateVideoMatrixAddress();
+                    UpdatePixelMatrixAddress();
+
                     break;
 
                 case 0x19:
-                    register[regnum] &= (byte)(~value);
+                    registers[register] &= (byte)~value;
+                    UpdateIrq();
                     break;
 
                 case 0x1A:
-                    rasterIntEnabled = ((value & 1) != 0);
-                    spriteBGCollide = ((value & 2) != 0);
-                    spriteSpriteCollide = ((value & 4) != 0);
-                    lightPenIntEnabled = ((value & 8) != 0);
+                    rasterIntEnabled = (value & 0x01) != 0;
+                    spriteBackgroundCollide = (value & 0x02) != 0;
+                    spriteSpriteCollide = (value & 0x04) != 0;
+                    UpdateIrq();
                     break;
 
                 case 0x1B:
                     for (int i = 0; i < 8; i++)
-                        sprites[i].TopMost = ((value & (1 << i)) == 0);
+                        sprites[i].TopMost = (value & (1 << i)) == 0;
                     break;
 
                 case 0x1C:
                     for (int i = 0; i < 8; i++)
-                        sprites[i].MulticolorMode = ((value & (1 << i)) != 0);
+                    {
+                        sprites[i].MulticolorMode = (value & (1 << i)) != 0;
+                        UpdateSpriteWidth(i);
+                    }
                     break;
 
                 case 0x1D:
                     for (int i = 0; i < 8; i++)
-                        if ((value & (1 << i)) != 0)
-                            sprites[i].Width = 48;
-                        else
-                            sprites[i].Width = 24;
-                    break;
-
-                case 0x27:
-                case 0x28:
-                case 0x29:
-                case 0x2A:
-                case 0x2B:
-                case 0x2C:
-                case 0x2D:
-                case 0x2E:
-                    int colorNum = regnum - 0x27;
-                    sprites[colorNum].SpriteColor = C64.palette.MapColorValue(value);
-                    break;
-            }
-        }
-
-        private void updateVMAddress()
-        {
-            videoMatrixAddress = (ushort)(bankAddress + (register[0x18] >> 4) * 0x400);
-        }
-
-        private void updatePMAddress()
-        {
-            if (bitmapMode)
-                pixelMatrixAddress = (ushort)(bankAddress + (register[0x18] & 0x08) * 0x400);
-            else
-                pixelMatrixAddress = (ushort)(bankAddress + (register[0x18] & 0x0E) * 0x400);
-        }
-
-        public byte GetRegister(int regnum)
-        {
-            switch (regnum)
-            {
-                case 0x11:
-                    return (byte)((register[regnum] & 0x7F) | ((currentHLine & 0x100) >> 1));
-                case 0x12:
-                    return (byte)(currentHLine & 0xFF);
-                case 0x13:
-                    return (byte)(currentVLine - 96);
-                case 0x14:
-                    return 0;
-                case 0x16:
-                    return (byte)(register[regnum] | 0xC0);
-                case 0x18:
-                    return (byte)(register[regnum] | 1);
-                case 0x19:
-                    return (byte)(register[regnum] | 0x70);
-                case 0x1A:
-                    return (byte)(register[regnum] | 0xF0);
-                case 0x1E:
-                case 0x1F:
-                    byte ret = register[regnum];
-                    register[regnum] = 0;
-                    return ret;
-                case 0x20:
-                case 0x21:
-                case 0x22:
-                case 0x23:
-                case 0x24:
-                case 0x25:
-                case 0x26:
-                case 0x27:
-                case 0x28:
-                case 0x29:
-                case 0x2A:
-                case 0x2B:
-                case 0x2C:
-                case 0x2D:
-                case 0x2E:
-                    return (byte)(register[regnum] | 0xF0);
-                default: return register[regnum];
-            }
-        }
-
-        public int NumRegisters
-        {
-            get
-            {
-                return NUM_REGISTERS;
-            }
-        }
-
-        private Pixel getSpritePixel(int sprite, int x, int y)
-        {
-            if (
-                x >= sprites[sprite].X &&
-                x < sprites[sprite].X + sprites[sprite].Width &&
-                y >= sprites[sprite].Y &&
-                y < sprites[sprite].Y + sprites[sprite].Height)
-            {
-                Pixel pixel = new Pixel();
-
-                int xOffset = x - sprites[sprite].X;
-                if (sprites[sprite].Width == 48) xOffset /= 2;
-                int yOffset = y - sprites[sprite].Y;
-                if (sprites[sprite].Height == 42) yOffset /= 2;
-
-                ushort address = (ushort)(videoMatrixAddress + 0x400 - (8 - sprite));
-                ushort spritePixelAddress = (ushort)(bankAddress + Peek(address) * 0x40);
-                
-                ushort position = (ushort)((yOffset * 24 + xOffset) / 8);
-                int bitPos = 7 - (xOffset % 8);
-                byte value = 0;
-
-                if (sprites[sprite].MulticolorMode)
-                {
-                    value =
-                        (byte)((Peek((ushort)(spritePixelAddress + position)) >> ((bitPos / 2) * 2)) & 3);
-                    
-                    switch (value)
                     {
-                        case 0: return emptyPixel;
-                        case 1:
-                            pixel.PixelColor = C64.palette.MapColorValue(register[0x25]);
-                            pixel.Background = false;
-                            break;
-                        case 2:
-                            pixel.PixelColor = sprites[sprite].SpriteColor;
-                            pixel.Background = false;
-                            break;
-                        case 3:
-                            pixel.PixelColor = C64.palette.MapColorValue(register[0x26]);
-                            pixel.Background = false;
-                            break;
+                        sprites[i].DoubleWidth = (value & (1 << i)) != 0;
+                        UpdateSpriteWidth(i);
+                    }
+                    break;
+
+                case >= 0x27 and <= 0x2E:
+                    sprites[register - 0x27].SpriteColor = C64Palette.Get(value);
+                    break;
+            }
+        }
+
+        public byte[] CapturePackedScreen()
+        {
+            int pixelCount = VisibleWidth * VisibleHeight;
+            byte[] packed = new byte[(pixelCount + 1) / 2];
+
+            lock (screenLock)
+            {
+                int position = 0;
+
+                for (int i = 0; i < pixelCount; i += 2)
+                {
+                    int x = i % VisibleWidth;
+                    int y = i / VisibleWidth;
+                    int high = C64Palette.ToIndex(frontBuffer[x, y]);
+                    int low = 0;
+
+                    if (i + 1 < pixelCount)
+                    {
+                        int nextX = (i + 1) % VisibleWidth;
+                        int nextY = (i + 1) / VisibleWidth;
+                        low = C64Palette.ToIndex(frontBuffer[nextX, nextY]);
                     }
 
-                    return pixel;
+                    packed[position++] = (byte)((high << 4) | low);
+                }
+            }
+
+            return packed;
+        }
+
+        public void SetPackedScreen(byte[] packed)
+        {
+            ArgumentNullException.ThrowIfNull(packed);
+
+            RgbColor[,] screen = new RgbColor[VisibleWidth, VisibleHeight];
+            int pixelCount = VisibleWidth * VisibleHeight;
+            int position = 0;
+
+            for (int i = 0; i < pixelCount && position < packed.Length; i += 2)
+            {
+                byte value = packed[position++];
+                screen[i % VisibleWidth, i / VisibleWidth] = C64Palette.Get(value >> 4);
+
+                if (i + 1 < pixelCount)
+                {
+                    screen[(i + 1) % VisibleWidth, (i + 1) / VisibleWidth] =
+                        C64Palette.Get(value & 0x0F);
+                }
+            }
+
+            SetScreen(screen);
+        }
+
+        private void RenderPixel(int x)
+        {
+            int y = currentHLine;
+
+            if (y < FirstRasterLine || y >= LastRasterLine)
+                return;
+
+            int screenX = x;
+            int screenY = y - FirstRasterLine;
+
+            if (
+                screenX < 0 ||
+                screenX >= VisibleWidth ||
+                screenY < 0 ||
+                screenY >= VisibleHeight)
+            {
+                return;
+            }
+
+            Pixel pixel = GetBackgroundPixel(x, y);
+            int collisionMask = 0;
+            int firstSprite = -1;
+            int firstFrontSprite = -1;
+            RgbColor firstSpriteColor = C64Palette.Get(0);
+            RgbColor firstFrontSpriteColor = C64Palette.Get(0);
+
+            for (int sprite = 0; sprite < 8; sprite++)
+            {
+                if (!sprites[sprite].Enabled)
+                    continue;
+
+                Pixel spritePixel = GetSpritePixel(
+                    sprite,
+                    x - SpriteXOrigin,
+                    y - SpriteYOrigin);
+
+                if (spritePixel.Background)
+                    continue;
+
+                collisionMask |= 1 << sprite;
+
+                if (firstSprite < 0)
+                {
+                    firstSprite = sprite;
+                    firstSpriteColor = spritePixel.PixelColor;
+                }
+
+                if (sprites[sprite].TopMost && firstFrontSprite < 0)
+                {
+                    firstFrontSprite = sprite;
+                    firstFrontSpriteColor = spritePixel.PixelColor;
+                }
+            }
+
+            bool spriteSpriteCollision =
+                collisionMask != 0 && (collisionMask & (collisionMask - 1)) != 0;
+            bool spriteBackgroundCollision = collisionMask != 0 && !pixel.Background;
+
+            if (spriteSpriteCollision)
+                registers[0x1E] |= (byte)collisionMask;
+
+            if (spriteBackgroundCollision)
+                registers[0x1F] |= (byte)collisionMask;
+
+            if (spriteSpriteCollision || spriteBackgroundCollision)
+                UpdateIrq();
+
+            int drawSprite = pixel.Background ? firstSprite : firstFrontSprite;
+            RgbColor color;
+
+            if (drawSprite < 0)
+                color = pixel.PixelColor;
+            else if (drawSprite == firstSprite)
+                color = firstSpriteColor;
+            else
+                color = firstFrontSpriteColor;
+
+            backBuffer[screenX, screenY] = color;
+        }
+
+        private Pixel GetBackgroundPixel(int x, int y)
+        {
+            // The border aperture is fixed by CSEL/RSEL and applies to the
+            // output pixel. XSCROLL moves the source under that aperture; it
+            // must not widen the border or shrink the visible columns.
+            if (
+                !screenEnabled ||
+                y < firstScreenLine ||
+                y > lastScreenLine ||
+                x < firstScreenPixel ||
+                x > lastScreenPixel)
+            {
+                return new Pixel
+                {
+                    Background = true,
+                    PixelColor = C64Palette.Get(registers[0x20])
+                };
+            }
+
+            // RSEL changes the fixed border aperture, but not where screen row 0
+            // begins: the first display line is always $30 + YSCROLL. Deriving
+            // the source row from the aperture conflated the two and made
+            // 24-row scrolling move four pixels per YSCROLL step instead of
+            // two (Boulder Dash rests at YSCROLL 7 with RSEL clear).
+            int sourceX = x - horizontalScroll;
+            int sourceY = y - (FirstDisplayLine + verticalScroll);
+
+            if (
+                sourceX < FirstScreenPixel ||
+                sourceX > LastScreenPixel ||
+                sourceY < 0 ||
+                sourceY >= 25 * 8)
+            {
+                // The VIC fetches the full 25-row matrix regardless of RSEL.
+                // With RSEL clear, fine scrolling exposes the start of row 24
+                // in the bottom six scanlines of the 24-row aperture. Boulder
+                // Dash relies on that during its YSCROLL 1 -> 7 wrap; clipping
+                // at the nominal 24-row height made the bottom strip vanish
+                // and pop back every coarse-scroll step.
+                return new Pixel
+                {
+                    Background = true,
+                    PixelColor = C64Palette.Get(registers[0x21])
+                };
+            }
+
+            return GetPixel(sourceX - FirstScreenPixel, sourceY);
+        }
+
+        private Pixel GetSpritePixel(int sprite, int x, int y)
+        {
+            ref Sprite spriteState = ref sprites[sprite];
+
+            if (
+                x < spriteState.X ||
+                x >= spriteState.X + spriteState.Width ||
+                y < spriteState.Y ||
+                y >= spriteState.Y + spriteState.Height)
+            {
+                return emptyPixel;
+            }
+
+            int xOffset = x - spriteState.X;
+            int yOffset = y - spriteState.Y;
+
+            xOffset /= spriteState.PixelScale;
+
+            if (spriteState.Height == 42)
+                yOffset /= 2;
+
+            ushort pointerAddress = (ushort)(videoMatrixAddress + 0x3F8 + sprite);
+            ushort spritePixelAddress = (ushort)(bankAddress + bus.Read(pointerAddress) * 0x40);
+            ushort position = (ushort)((yOffset * 24 + xOffset) / 8);
+            int bitPosition = 7 - (xOffset % 8);
+            byte value;
+
+            if (spriteState.MulticolorMode)
+            {
+                value = (byte)(
+                    (bus.Read((ushort)(spritePixelAddress + position)) >>
+                    ((bitPosition / 2) * 2)) & 0x03);
+
+                return value switch
+                {
+                    0 => emptyPixel,
+                    1 => new Pixel
+                    {
+                        Background = false,
+                        PixelColor = C64Palette.Get(registers[0x25])
+                    },
+                    2 => new Pixel
+                    {
+                        Background = false,
+                        PixelColor = spriteState.SpriteColor
+                    },
+                    _ => new Pixel
+                    {
+                        Background = false,
+                        PixelColor = C64Palette.Get(registers[0x26])
+                    }
+                };
+            }
+
+            value = (byte)(
+                (bus.Read((ushort)(spritePixelAddress + position)) >> bitPosition) & 0x01);
+
+            if (value == 0)
+                return emptyPixel;
+
+            return new Pixel
+            {
+                Background = false,
+                PixelColor = spriteState.SpriteColor
+            };
+        }
+
+        private Pixel GetPixel(int x, int y)
+        {
+            return currentVideoMode switch
+            {
+                VideoMode.SimpleCharacterMode => GetSimpleCharacterPixel(x, y),
+                VideoMode.MultiColorCharacterMode => GetMultiColorCharacterPixel(x, y),
+                VideoMode.ExtendedColorCharacterMode => GetExtendedColorCharacterPixel(x, y),
+                VideoMode.SimpleBitMapMode => GetSimpleBitmapPixel(x, y),
+                VideoMode.MultiColorBitMapMode => GetMultiColorBitmapPixel(x, y),
+                _ => emptyPixel
+            };
+        }
+
+        private Pixel GetSimpleCharacterPixel(int x, int y)
+        {
+            int cell = x / 8;
+            int bit = x % 8;
+
+            if ((glyphRow[cell] & (0x80 >> bit)) != 0)
+            {
+                return new Pixel
+                {
+                    Background = false,
+                    PixelColor = C64Palette.Get(colorRow[cell])
+                };
+            }
+
+            return new Pixel
+            {
+                Background = true,
+                PixelColor = C64Palette.Get(registers[0x21])
+            };
+        }
+
+        private Pixel GetMultiColorCharacterPixel(int x, int y)
+        {
+            int cell = x / 8;
+            int bit = x % 8;
+
+            if ((colorRow[cell] & 0x08) == 0)
+                return GetSimpleCharacterPixel(x, y);
+
+            int value = (glyphRow[cell] >> (2 * ((7 - bit) / 2))) & 0x03;
+
+            return value switch
+            {
+                0 => new Pixel
+                {
+                    Background = true,
+                    PixelColor = C64Palette.Get(registers[0x21])
+                },
+                1 => new Pixel
+                {
+                    Background = false,
+                    PixelColor = C64Palette.Get(registers[0x22])
+                },
+                2 => new Pixel
+                {
+                    Background = false,
+                    PixelColor = C64Palette.Get(registers[0x23])
+                },
+                _ => new Pixel
+                {
+                    Background = false,
+                    PixelColor = C64Palette.Get(colorRow[cell] & 0x07)
+                }
+            };
+        }
+
+        private Pixel GetExtendedColorCharacterPixel(int x, int y)
+        {
+            int cell = x / 8;
+            int bit = x % 8;
+            int backgroundIndex = (matrixRow[cell] >> 6) & 0x03;
+
+            if ((glyphRow[cell] & (0x80 >> bit)) != 0)
+            {
+                return new Pixel
+                {
+                    Background = false,
+                    PixelColor = C64Palette.Get(colorRow[cell])
+                };
+            }
+
+            return new Pixel
+            {
+                Background = true,
+                PixelColor = C64Palette.Get(registers[0x21 + backgroundIndex])
+            };
+        }
+
+        private Pixel GetSimpleBitmapPixel(int x, int y)
+        {
+            int cell = x / 8;
+            byte color = matrixRow[cell];
+            int bit = x % 8;
+
+            if ((glyphRow[cell] & (0x80 >> bit)) != 0)
+            {
+                return new Pixel
+                {
+                    Background = false,
+                    PixelColor = C64Palette.Get(color >> 4)
+                };
+            }
+
+            return new Pixel
+            {
+                Background = true,
+                PixelColor = C64Palette.Get(color & 0x0F)
+            };
+        }
+
+        private Pixel GetMultiColorBitmapPixel(int x, int y)
+        {
+            int cell = x / 8;
+            byte color = matrixRow[cell];
+            int bit = x % 8;
+            int value = (glyphRow[cell] >> (2 * ((7 - bit) / 2))) & 0x03;
+
+            return value switch
+            {
+                0 => new Pixel
+                {
+                    Background = true,
+                    PixelColor = C64Palette.Get(registers[0x21])
+                },
+                1 => new Pixel
+                {
+                    Background = false,
+                    PixelColor = C64Palette.Get(color >> 4)
+                },
+                2 => new Pixel
+                {
+                    Background = false,
+                    PixelColor = C64Palette.Get(color & 0x0F)
+                },
+                _ => new Pixel
+                {
+                    Background = false,
+                    PixelColor = C64Palette.Get(colorRow[cell])
+                }
+            };
+        }
+
+        private void ProcessVideoCycle(int cycle)
+        {
+            // The matrix/color fetch for the next character cell precedes the
+            // graphics fetch by one cycle. Screen column 0 starts at raster
+            // pixel 120 (cycle 15), so it uses a matrix byte fetched at 14 and
+            // a graphics byte fetched at 15.
+            if (lineIsBadline && cycle >= 14 && cycle <= 53)
+                FetchMatrixCell(cycle - 14);
+
+            if (cycle >= 15 && cycle <= 54)
+            {
+                FetchGlyphCell(cycle - 15);
+
+                // AEC is low for the badline's 40 C-access cycles. These are
+                // bus cycles the CPU does not get to use.
+                if (lineIsBadline)
+                    IncrementStolenCycles();
+            }
+
+            if (SpriteStealsCycle(cycle))
+                IncrementStolenCycles();
+
+            if (!renderPixels)
+                return;
+
+            frameRendered = true;
+
+            int pixelStart = cycle * PixelsPerCycle - FirstLinePixel;
+
+            for (int x = pixelStart; x < pixelStart + PixelsPerCycle; x++)
+            {
+                if (x >= 0 && x < VisibleWidth)
+                    RenderPixel(x);
+            }
+        }
+
+        private void BeginRasterLine()
+        {
+            if (currentHLine == FirstDisplayLine)
+            {
+                // DEN is sampled while raster $30 is active. VCBASE restarts
+                // at the top of the matrix for the new frame.
+                denLatched = false;
+                videoCounterBase = 0;
+                rowCounter = 0;
+                previousLineWasBadline = false;
+            }
+
+            if (currentHLine == FirstDisplayLine && screenEnabled)
+                denLatched = true;
+
+            lineIsBadline =
+                denLatched &&
+                currentHLine >= FirstDisplayLine &&
+                currentHLine <= 0xF7 &&
+                (currentHLine & 0x07) == verticalScroll;
+
+            // VCBASE advances when a character row completes, not on every
+            // badline. During raster splits badlines can be closer than eight
+            // scanlines; advancing the row at each fetch made the display
+            // switch rows when the split landed mid-row.
+            if (rowCounter == 7)
+                videoCounterBase = (videoCounterBase + 40) & 0x03FF;
+
+            if (lineIsBadline)
+            {
+                // A normal badline starts a new character row. Forced
+                // badlines can occur on consecutive scanlines (FLI and other
+                // raster tricks); those must keep advancing the row counter
+                // instead of redrawing bitmap row zero on every line.
+                rowCounter = previousLineWasBadline
+                    ? (rowCounter + 1) & 0x07
+                    : 0;
+                matrixRowStart = videoCounterBase;
+            }
+            else
+            {
+                rowCounter = (rowCounter + 1) & 0x07;
+            }
+
+            previousLineWasBadline = lineIsBadline;
+            UpdateSpriteDma();
+        }
+
+        private void FetchMatrixCell(int column)
+        {
+            int offset = (matrixRowStart + column) & 0x03FF;
+
+            matrixRow[column] = bus.Read(
+                (ushort)(videoMatrixAddress + offset));
+            colorRow[column] = colorRam.ReadNibble((ushort)offset);
+        }
+
+        private void FetchGlyphCell(int column)
+        {
+            int cell = bitmapMode ? matrixRowStart + column : matrixRow[column];
+
+            if (currentVideoMode == VideoMode.ExtendedColorCharacterMode)
+                cell = matrixRow[column] & 0x3F;
+
+            glyphRow[column] = bus.Read(
+                (ushort)(pixelMatrixAddress + cell * 8 + rowCounter));
+        }
+
+        private void UpdateSpriteDma()
+        {
+            for (int sprite = 0; sprite < sprites.Length; sprite++)
+            {
+                if (!sprites[sprite].Enabled)
+                {
+                    spriteDmaActive[sprite] = false;
+                    spriteDmaRemaining[sprite] = 0;
+                    continue;
+                }
+
+                if (currentHLine == sprites[sprite].Y + SpriteYOrigin)
+                {
+                    spriteDmaActive[sprite] = true;
+                    spriteDmaRemaining[sprite] = Math.Max(0, sprites[sprite].Height - 1);
+                }
+                else if (spriteDmaRemaining[sprite] > 0)
+                {
+                    spriteDmaActive[sprite] = true;
+                    spriteDmaRemaining[sprite]--;
                 }
                 else
                 {
-                    value =
-                        (byte)((Peek((ushort)(spritePixelAddress + position)) >> bitPos) & 1);
-
-                    if (value == 0)
-                        return emptyPixel;
-                    else
-                    {
-                        pixel.PixelColor = sprites[sprite].SpriteColor;
-                        pixel.Background = false;
-                        return pixel;
-                    }
+                    spriteDmaActive[sprite] = false;
                 }
             }
+        }
+
+        private bool SpriteStealsCycle(int cycle)
+        {
+            return IsSpriteFetchCycle(cycle);
+        }
+
+        private bool IsSpriteFetchCycle(int cycle)
+        {
+            for (int sprite = 0; sprite < sprites.Length; sprite++)
+            {
+                if (!spriteDmaActive[sprite])
+                    continue;
+
+                int firstCycle = GetSpriteFetchCycle(sprite);
+
+                if (cycle == firstCycle || cycle == firstCycle + 1)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool IsAecLow(int cycle)
+        {
+            if (lineIsBadline && cycle >= 15 && cycle <= 54)
+                return true;
+
+            return IsSpriteFetchCycle(cycle);
+        }
+
+        private bool IsBaLow(int cycle)
+        {
+            if (IsAecLow(cycle))
+                return true;
+
+            // The badline C-access run starts on cycle 15, so BA is asserted
+            // on cycles 12-14 to give the 6510 time to finish a write.
+            if (lineIsBadline && cycle >= 12 && cycle < 15)
+                return true;
+
+            for (int sprite = 0; sprite < sprites.Length; sprite++)
+            {
+                if (!spriteDmaActive[sprite])
+                    continue;
+
+                int firstCycle = GetSpriteFetchCycle(sprite);
+                int leadStart = Math.Max(0, firstCycle - 3);
+
+                if (cycle >= leadStart && cycle < firstCycle)
+                    return true;
+            }
+
+            // Sprite 3's first fetch is on cycle 0, so its BA lead-in lives in
+            // the last three cycles of the previous raster line.
+            int lineCycles = GetLineCycles(currentHLine);
+
+            for (int sprite = 0; sprite < sprites.Length; sprite++)
+            {
+                if (!WillSpriteDmaBeActiveOnNextLine(sprite))
+                    continue;
+
+                int firstCycle = GetSpriteFetchCycle(sprite);
+
+                if (firstCycle >= 3)
+                    continue;
+
+                int leadStart = lineCycles + firstCycle - 3;
+
+                if (cycle >= leadStart)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool WillSpriteDmaBeActiveOnNextLine(int sprite)
+        {
+            if (!sprites[sprite].Enabled)
+                return false;
+
+            int nextLine = currentHLine + 1 >= RasterLines
+                ? 0
+                : currentHLine + 1;
+
+            return
+                nextLine == sprites[sprite].Y + SpriteYOrigin ||
+                spriteDmaRemaining[sprite] > 0;
+        }
+
+        private static int GetSpriteFetchCycle(int sprite)
+        {
+            return sprite switch
+            {
+                0 => 57,
+                1 => 59,
+                2 => 61,
+                3 => 0,
+                4 => 2,
+                5 => 4,
+                6 => 6,
+                _ => 8
+            };
+        }
+
+        private void IncrementStolenCycles()
+        {
+            // The machine now stalls the CPU at each access instead of
+            // draining this counter every instruction. Keep the legacy
+            // accounting available for diagnostics without overflowing
+            // during long runs.
+            if (stolenCycles < int.MaxValue)
+                stolenCycles++;
+        }
+
+        private void CompleteFrame()
+        {
+            if (!frameRendered)
+                return;
+
+            frameRendered = false;
+
+            lock (screenLock)
+            {
+                (frontBuffer, backBuffer) = (backBuffer, frontBuffer);
+            }
+        }
+
+        private void ScheduleRasterInterrupt()
+        {
+            if (currentHLine != rasterIntLine)
+            {
+                rasterIrqCountdown = 0;
+                return;
+            }
+
+            // The VIC raises the raster IRQ flag on cycle 1 of the matching
+            // line. Two countdown steps keep the flag out of cycle 0.
+            rasterIrqCountdown = 2;
+        }
+
+        private void AdvanceRasterInterrupt()
+        {
+            if (rasterIrqCountdown <= 0)
+                return;
+
+            rasterIrqCountdown--;
+
+            if (rasterIrqCountdown == 0)
+            {
+                registers[0x19] |= 0x01;
+                UpdateIrq();
+            }
+        }
+
+        private void CancelStaleRasterInterrupt()
+        {
+            if (currentHLine != rasterIntLine)
+                rasterIrqCountdown = 0;
+        }
+
+        private int GetRasterLineForRead()
+        {
+            // At cycle 0 of line 0 the raster counter still reads the last
+            // line of the previous frame on a PAL 6569.
+            return currentHLine == 0 && currentCycle == 0
+                ? RasterLines - 1
+                : currentHLine;
+        }
+
+        private static int GetLineCycles(int line)
+        {
+            if (line == 0)
+                return FirstLineCycles;
+
+            if (line == RasterLines - 1)
+                return LastLineCycles;
+
+            return CyclesPerLine;
+        }
+
+        private void UpdateIrq()
+        {
+            bool asserted =
+                (rasterIntEnabled && (registers[0x19] & 0x01) != 0) ||
+                (spriteBackgroundCollide && (registers[0x19] & 0x02) != 0) ||
+                (spriteSpriteCollide && (registers[0x19] & 0x04) != 0);
+
+            if (asserted)
+                registers[0x19] |= 0x80;
             else
-                return emptyPixel;
+                registers[0x19] &= 0x7F;
+
+            interrupts.Set(InterruptSource.Vic, asserted);
         }
 
-        private Pixel getPixel(int x, int y)
+        private void UpdateSpriteWidth(int sprite)
         {
-            switch (currentVideoMode)
-            {
-                case VideoMode.SimpleCharacterMode: return getSCM(x, y);
-                case VideoMode.MultiColorCharacterMode: return getMCCM(x, y);
-                case VideoMode.ExtendedColorCharacterMode: return getECCM(x, y);
-                case VideoMode.SimpleBitMapMode: return getSBMM(x, y);
-                case VideoMode.MultiColorBitMapMode: return getMCBMM(x, y);
-                default: return emptyPixel;
-            }
+            // Multicolour and double-width sprites both double each source
+            // pixel. They can be enabled together, giving 96 output pixels
+            // from the same 24 bytes of sprite data.
+            int scale =
+                (sprites[sprite].MulticolorMode ? 2 : 1) *
+                (sprites[sprite].DoubleWidth ? 2 : 1);
+
+            sprites[sprite].PixelScale = scale;
+            sprites[sprite].Width = 24 * scale;
         }
 
-        private Pixel getSCM(int x, int y)
+        private void UpdateVideoMode()
         {
-            Pixel pixel = new Pixel();
-            ushort position = (ushort)(y / 8 * 40 + x / 8);
-            byte value = Peek((ushort)(videoMatrixAddress + position));
-            int xRem = x % 8;
-            int yRem = y % 8;
+            currentVideoMode = (VideoMode)(
+                (registers[0x11] & 0x60) |
+                (registers[0x16] & 0x10));
 
-            if ((Peek((ushort)(pixelMatrixAddress + value * 8 + yRem)) & (byte)(0x80 >> xRem)) != 0)
-            {
-                pixel.PixelColor = C64.palette.MapColorPosition(position);
-                pixel.Background = false;
-                return pixel;
-            }
-            else
-            {
-                pixel.PixelColor = C64.palette.MapColorValue(register[0x21]);
-                pixel.Background = true;
-                return pixel;
-            }
+            bitmapMode = ((byte)currentVideoMode & 0x20) != 0;
         }
 
-        private Pixel getMCCM(int x, int y)
+        private void UpdateScreenGeometry()
         {
-            Pixel pixel = new Pixel();
-            ushort position = (ushort)(y / 8 * 40 + x / 8);
-            byte value = Peek((ushort)(videoMatrixAddress + position));
-            int xRem = x % 8;
-            int yRem = y % 8;
+            firstScreenLine = textRows == 24 ? FirstScreenLine + 4 : FirstScreenLine;
+            lastScreenLine = textRows == 24 ? LastScreenLine - 4 : LastScreenLine;
 
-            if ((C64.palette.Peek(position) & 0x8) != 0)
-            {
-                switch ((Peek((ushort)(pixelMatrixAddress + value * 8 + yRem)) >> (2 * ((7 - xRem) / 2))) & 0x3)
-                {
-                    case 0:
-                        pixel.PixelColor = C64.palette.MapColorValue(register[0x21]);
-                        pixel.Background = true;
-                        break;
-                    case 1: 
-                        pixel.PixelColor = C64.palette.MapColorValue(register[0x22]);
-                        pixel.Background = true;
-                        break;
-                    case 2: 
-                        pixel.PixelColor = C64.palette.MapColorValue(register[0x23]);
-                        pixel.Background = false;
-                        break;
-                    case 3: 
-                        pixel.PixelColor = C64.palette.MapColorValue((byte)(C64.palette.Peek(position) & 0x7));
-                        pixel.Background = false;
-                        break;
-                    default: return emptyPixel;
-                }
-
-                return pixel;
-            }
-            else
-                return getSCM(x, y);
+            firstScreenPixel = textColumns == 38
+                ? FirstScreenPixel + 7
+                : FirstScreenPixel;
+            lastScreenPixel = firstScreenPixel + (textColumns == 38 ? 304 : 320) - 1;
         }
 
-        private Pixel getECCM(int x, int y)
+        private void TryStartForcedBadline(byte value)
         {
-            Pixel pixel = new Pixel();
-            ushort position = (ushort)(y / 8 * 40 + x / 8);
-            byte value = Peek((ushort)(videoMatrixAddress + position));
-            int xRem = x % 8;
-            int yRem = y % 8;
-
-            byte bgColor = (byte)((value & 0xC0) >> 6);
-            value = (byte)(value & 0x3F);
-
-            if ((Peek((ushort)(pixelMatrixAddress + value * 8 + yRem)) & (byte)(0x80 >> xRem)) != 0)
+            if (
+                !denLatched ||
+                !screenEnabled ||
+                lineIsBadline ||
+                currentHLine < FirstDisplayLine ||
+                currentHLine > 0xF7 ||
+                (currentHLine & 0x07) != (value & 0x07))
             {
-                pixel.PixelColor = C64.palette.MapColorPosition(position);
-                pixel.Background = false;
-                return pixel;
+                return;
             }
-            else
-            {
-                pixel.PixelColor = C64.palette.MapColorValue(register[0x21 + bgColor]);
-                pixel.Background = true;
-                return pixel;
-            }
+
+            // A raster routine can write YSCROLL on cycle 14 to force a
+            // partial badline for the current line (FLI). That refreshes the
+            // matrix and color latches but must not restart the bitmap row.
+            lineIsBadline = true;
+            matrixRowStart = videoCounterBase;
+            previousLineWasBadline = true;
         }
 
-        private Pixel getSBMM(int x, int y)
+        private void UpdateVideoMatrixAddress()
         {
-            Pixel pixel = new Pixel();
-            ushort position = (ushort)(y / 8 * 40 + x / 8);
-            byte value = Peek((ushort)(videoMatrixAddress + position));
-            int xRem = x % 8;
-            int yRem = y % 8;
-
-            if ((Peek((ushort)(pixelMatrixAddress + position * 8 + yRem)) & (byte)(0x80 >> xRem)) != 0)
-            {
-                pixel.PixelColor = C64.palette.MapColorValue((byte)((value & 0xF0) >> 4));
-                pixel.Background = false;
-                return pixel;
-            }
-            else
-            {
-                pixel.PixelColor = C64.palette.MapColorValue((byte)(value & 0xF));
-                pixel.Background = true;
-                return pixel;
-            }
+            videoMatrixAddress = (ushort)(
+                bankAddress + (registers[0x18] >> 4) * 0x400);
         }
 
-        private Pixel getMCBMM(int x, int y)
+        private void UpdatePixelMatrixAddress()
         {
-            Pixel pixel = new Pixel();
-            ushort position = (ushort)(y / 8 * 40 + x / 8);
-            byte value = Peek((ushort)(videoMatrixAddress + position));
-            int xRem = x % 8;
-            int yRem = y % 8;
-
-            switch ((Peek((ushort)(pixelMatrixAddress + position * 8 + yRem)) >> (2 * ((7 - xRem) / 2))) & 0x3)
-            {
-                case 0: 
-                    pixel.PixelColor = C64.palette.MapColorValue(register[0x21]);
-                    pixel.Background = true;
-                    break;
-                case 1: 
-                    pixel.PixelColor = C64.palette.MapColorValue((byte)((value & 0xF0) >> 4));
-                    pixel.Background = true;
-                    break;
-                case 2: 
-                    pixel.PixelColor = C64.palette.MapColorValue((byte)(value & 0xF));
-                    pixel.Background = false;
-                    break;
-                case 3: 
-                    pixel.PixelColor = C64.palette.MapColorPosition(position);
-                    pixel.Background = false;
-                    break;
-                default: return emptyPixel;
-            }
-
-            return pixel;
+            pixelMatrixAddress = bitmapMode
+                ? (ushort)(bankAddress + (registers[0x18] & 0x08) * 0x400)
+                : (ushort)(bankAddress + (registers[0x18] & 0x0E) * 0x400);
         }
     }
 }

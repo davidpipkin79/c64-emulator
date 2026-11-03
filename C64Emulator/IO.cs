@@ -1,127 +1,106 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
+using System;
 
 namespace C64Emulator
 {
-    class IO
+    /// <summary>
+    /// The $D000-$DFFF I/O area. Each chip is mirrored across its 256-byte
+    /// page, and the CIA registers repeat every 16 bytes. Addresses that do
+    /// not decode to a chip read as open bus (0xFF here).
+    /// </summary>
+    internal sealed class IO : IIoPort
     {
-        private const int IO_SIZE = 0x1000;
-        private const ushort IO_POS = 0xD000;
-        private const ushort IO_PORT = 0x0001;
-        private const ushort KEYBOARD_BUFFER = 0x0277;
-        private const ushort KBBUFFER_COUNT = 0x00C6;
-        private const ushort KEYCODES_TABLE1 = 0xEB81;
-        private const ushort KEYCODES_TABLE2 = 0xEBC2;
-        private const ushort KEYCODES_TABLE3 = 0xEC03;
-        private const ushort KEYCODES_TABLE4 = 0xEC78;
-        private const int KEYTABLE_LENGTH = 0x40;
+        private const int VicPageSize = 0x400;
+        private const int SidPageSize = 0x400;
+        private const int CiaMirrorSize = 0x100;
 
-        private ushort vicRegPos;
-        private ushort sidRegPos;
-        private ushort palettePos;
-        private ushort cia1Pos;
-        private ushort cia2Pos;
+        private readonly VIC vic;
+        private readonly SID sid;
+        private readonly ColorRam colorRam;
+        private readonly CIA1 cia1;
+        private readonly CIA2 cia2;
 
-        public IO()
+        public IO(VIC vic, SID sid, ColorRam colorRam, CIA1 cia1, CIA2 cia2)
         {
-            vicRegPos = (ushort)(C64.vic.RegistersPosition - IO_POS);
-            sidRegPos = (ushort)(C64.sid.RegistersPosition - IO_POS);
-            palettePos = (ushort)(C64.palette.Position - IO_POS);
-            cia1Pos = (ushort)(C64.cia1.Position - IO_POS);
-            cia2Pos = (ushort)(C64.cia2.Position - IO_POS);
+            this.vic = vic ?? throw new ArgumentNullException(nameof(vic));
+            this.sid = sid ?? throw new ArgumentNullException(nameof(sid));
+            this.colorRam = colorRam ?? throw new ArgumentNullException(nameof(colorRam));
+            this.cia1 = cia1 ?? throw new ArgumentNullException(nameof(cia1));
+            this.cia2 = cia2 ?? throw new ArgumentNullException(nameof(cia2));
         }
 
-        public int Size
-        {
-            get
-            {
-                return IO_SIZE;
-            }
-        }
+        public int Size => AddressMap.IoEnd - AddressMap.IoStart;
 
-        public ushort Position
-        {
-            get
-            {
-                return IO_POS;
-            }
-        }
+        public ushort Position => AddressMap.IoStart;
 
-        public ushort IOPort
-        {
-            get
-            {
-                return IO_PORT;
-            }
-        }
-
+        // IIoPort addresses are offsets from $D000, not absolute bus addresses.
         public byte Peek(ushort address)
         {
-            if (address >= vicRegPos && address < vicRegPos + 0x03FF)
-            {
-                int regNum = (address - vicRegPos) % 0x40;
-
-                if (regNum >= C64.vic.NumRegisters)
-                    return 0xFF;
-                else
-                    return C64.vic.GetRegister(regNum);
-            }
-            else if (address >= sidRegPos && address < sidRegPos + 0x03FF)
-            {
-                int regNum = (address - sidRegPos) % 0x20;
-
-                if (regNum >= C64.sid.NumRegisters)
-                    return 0xFF;
-                else
-                    return C64.sid.GetRegister(regNum);
-            }
-            else if (address >= palettePos && address < palettePos + C64.palette.Size)
-                return C64.palette.Peek((ushort)(address - palettePos));
-            else if (address >= cia1Pos && address < cia1Pos + C64.cia1.Size)
-            {
-                address = (ushort)((address - cia1Pos) % 0x10);
-                return C64.cia1.Peek(address);
-            }
-            else if (address >= cia2Pos && address < cia2Pos + C64.cia2.Size)
-            {
-                address = (ushort)((address - cia2Pos) % 0x10);
-                return C64.cia2.Peek(address);
-            }
-            else
+            if (address >= Size)
                 return 0xFF;
+
+            if (address < VicPageSize)
+            {
+                int register = address & 0x3F;
+                return register < VIC.RegisterCount ? vic.GetRegister(register) : (byte)0xFF;
+            }
+
+            if (address < SidPageSize + 0x400)
+            {
+                int register = (address - 0x400) & 0x1F;
+                return register < SID.RegisterCount ? sid.GetRegister(register) : (byte)0xFF;
+            }
+
+            if (address < 0xC00)
+                return colorRam.Read((ushort)(address - 0x800));
+
+            if (address < 0xD00)
+                return cia1.Peek((ushort)(address & 0x0F));
+
+            if (address < 0xE00)
+                return cia2.Peek((ushort)(address & 0x0F));
+
+            return 0xFF;
         }
 
         public void Poke(ushort address, byte value)
         {
-            if (address >= vicRegPos && address < vicRegPos + C64.vic.NumRegisters)
-            {
-                int regnum = (address - vicRegPos) % 0x40;
+            if (address >= Size)
+                return;
 
-                if (regnum < C64.vic.NumRegisters)
-                    C64.vic.SetRegister(regnum, value);
-            }
-            else if (address >= sidRegPos && address < sidRegPos + C64.sid.NumRegisters)
+            if (address < VicPageSize)
             {
-                int regnum = (address - sidRegPos) % 0x20;
+                int register = address & 0x3F;
 
-                if (regnum < C64.sid.NumRegisters)
-                    C64.sid.SetRegister(regnum, value);
+                if (register < VIC.RegisterCount)
+                    vic.SetRegister(register, value);
+
+                return;
             }
-            else if (address >= palettePos && address < palettePos + C64.palette.Size)
-                C64.palette.Poke((ushort)(address - palettePos), value);
-            else if (address == C64.vic.BankAddressPosition - IO_POS)
-                C64.vic.BankAddress = value;
-            else if (address >= cia1Pos && address < cia1Pos + C64.cia1.Size)
+
+            if (address < SidPageSize + 0x400)
             {
-                address = (ushort)((address - cia1Pos) % 0x10);
-                C64.cia1.Poke(address, value);
+                int register = (address - 0x400) & 0x1F;
+
+                if (register < SID.RegisterCount)
+                    sid.SetRegister(register, value);
+
+                return;
             }
-            else if (address >= cia2Pos && address < cia2Pos + C64.cia2.Size)
+
+            if (address < 0xC00)
             {
-                address = (ushort)((address - cia2Pos) % 0x10);
-                C64.cia2.Poke(address, value);
+                colorRam.Write((ushort)(address - 0x800), value);
+                return;
             }
+
+            if (address < 0xD00)
+            {
+                cia1.Poke((ushort)(address & 0x0F), value);
+                return;
+            }
+
+            if (address < 0xE00)
+                cia2.Poke((ushort)(address & 0x0F), value);
         }
     }
 }
