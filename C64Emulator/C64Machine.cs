@@ -979,7 +979,27 @@ namespace C64Emulator
 
                 Volatile.Write(ref speedPercentage, measured);
                 last = now;
-                target = now + FrameTicks;
+
+                if (IsWarping)
+                {
+                    // Warp is unpaced; do not accumulate a deadline that
+                    // would have to be waited out when the key is released.
+                    target = now + FrameTicks;
+                }
+                else
+                {
+                    // Advance by exactly one frame. Rebasing on the current
+                    // time after every wake-up turned each late wake-up into
+                    // a permanently slower cadence, which made PAL music play
+                    // flat and slow.
+                    target += FrameTicks;
+
+                    // A long host stall (debugger, sleep) must not produce a
+                    // burst of catch-up frames.
+                    if (now - target > FrameTicks)
+                        target = now + FrameTicks;
+                }
+
                 frameCycles -= CyclesPerFrame;
             }
 

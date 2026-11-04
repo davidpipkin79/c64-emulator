@@ -62,6 +62,7 @@ namespace C64Emulator
             try
             {
                 machine = new C64Machine(RomSet.Load(AppContext.BaseDirectory));
+                SoundTrace.AttachFromEnvironment(machine);
                 machine.TrueDriveEmulation = AppSettings.Current.TrueDriveEmulation;
                 machine.Sid.OutputVolume = AppSettings.Current.AudioVolume;
                 machine.Sid.Muted = AppSettings.Current.AudioMuted;
@@ -124,6 +125,8 @@ namespace C64Emulator
                     frameReady = true;
                 }
 
+                bool drewFrame = false;
+
                 if (frameReady)
                 {
                     bool warping = machine?.IsWarping == true;
@@ -136,6 +139,7 @@ namespace C64Emulator
                     if (!warping || drawNow >= nextWarpDraw)
                     {
                         renderer?.Draw();
+                        drewFrame = true;
 
                         if (warping)
                             nextWarpDraw = drawNow + Stopwatch.Frequency / 30;
@@ -158,36 +162,31 @@ namespace C64Emulator
                     continue;
                 }
 
-                if (renderer.VSyncEnabled)
+                // Present each completed frame once, immediately. Waiting for
+                // a separate timer submitted duplicate frames and added up to
+                // several milliseconds of delay jitter, which shows up as an
+                // uneven picture during hardware scrolling.
+                long now = Stopwatch.GetTimestamp();
+                bool present = drewFrame;
+
+                if (!present && now >= nextPresent)
+                {
+                    // No new frame: keep menus, status text and the window
+                    // itself refreshed without submitting duplicates at the
+                    // full speed of the host loop.
+                    present = true;
+                }
+
+                if (present)
                 {
                     renderer.Present();
-                    continue;
+                    nextPresent =
+                        Stopwatch.GetTimestamp() + C64Machine.FrameDurationTicks;
                 }
-
-                long interval = machine?.IsWarping == true
-                    ? Math.Max(1, C64Machine.FrameDurationTicks / 2)
-                    : C64Machine.FrameDurationTicks;
-                long now = Stopwatch.GetTimestamp();
-
-                if (now < nextPresent)
+                else
                 {
-                    double remaining =
-                        (nextPresent - now) * 1000.0 / Stopwatch.Frequency;
-                    int delay = Math.Clamp((int)Math.Ceiling(remaining), 1, 5);
-
-                    SDL.Delay((uint)delay);
-                    continue;
+                    SDL.Delay(1);
                 }
-
-                renderer.Present();
-
-                long presentedAt = Stopwatch.GetTimestamp();
-                nextPresent = now + interval;
-
-                // Do not present a burst of catch-up frames after the host
-                // misses a deadline; resume the cadence from the next slot.
-                if (nextPresent <= presentedAt)
-                    nextPresent = presentedAt + interval;
             }
         }
 
@@ -529,7 +528,8 @@ namespace C64Emulator
                     $"RASTER={vic.RasterLine}/{vic.RasterCycle} " +
                     $"YSCROLL={vic.VerticalScroll} XSCROLL={vic.HorizontalScroll} " +
                     $"C1={machine.Memory.Peek(0xC1):X2} C2={machine.Memory.Peek(0xC2):X2} " +
-                    $"JAM={machine.Cpu.IsJammed} TRUE_DRIVE={machine.TrueDriveEmulation}"
+                    $"JAM={machine.Cpu.IsJammed} TRUE_DRIVE={machine.TrueDriveEmulation} " +
+                    $"VOL={machine.Sid.OutputVolume} MUTED={machine.Sid.Muted}"
                 };
 
                 for (int register = 0; register < 0x2F; register++)

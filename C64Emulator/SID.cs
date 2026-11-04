@@ -58,7 +58,7 @@ namespace C64Emulator
 
         /// <summary>
         /// Host-side master volume, independent of the SID's $D418 register.
-        /// Values are clamped to 0-100.
+        /// Values are clamped to 0-100 and mapped with a perceptual taper.
         /// </summary>
         public int OutputVolume
         {
@@ -71,6 +71,13 @@ namespace C64Emulator
             get => muted;
             set => muted = value;
         }
+
+        /// <summary>
+        /// Optional diagnostic hook invoked for every CPU write to a SID
+        /// register. Used by the sound trace to record the writer's PC and the
+        /// processor-port banking at the time of the write.
+        /// </summary>
+        public Action<int, byte>? RegisterWriteHook { get; set; }
 
         public byte GetRegister(int register)
         {
@@ -92,6 +99,7 @@ namespace C64Emulator
             if ((uint)register >= RegisterCount)
                 return;
 
+            RegisterWriteHook?.Invoke(register, value);
             registers[register] = value;
 
             if (register <= 20)
@@ -401,11 +409,45 @@ namespace C64Emulator
                 direct += filteredInput;
 
             double volume = (mode & 0x0F) / 15.0;
-            double hostVolume = muted ? 0.0 : outputVolume / 100.0;
+            double hostVolume = muted ? 0.0 : HostGain(outputVolume);
             double output = direct * volume * MasterGain * hostVolume;
-            double scaled = Math.Clamp(output, -1.0, 1.0) * short.MaxValue;
+            double scaled = SoftLimit(output) * short.MaxValue;
 
             return (short)Math.Round(scaled);
+        }
+
+        /// <summary>
+        /// Maps the 0-100 host volume onto an amplitude gain with a perceptual
+        /// taper. A linear mapping leaves 5% at only -26 dB, which still sounds
+        /// loud; loudness is roughly logarithmic, so squaring the fraction
+        /// keeps 100% at full scale and makes the low end genuinely quiet
+        /// (50% is a quarter of the amplitude, 5% is 1/400).
+        /// </summary>
+        private static double HostGain(int percent)
+        {
+            double fraction = Math.Clamp(percent, 0, 100) / 100.0;
+
+            return fraction * fraction;
+        }
+
+        /// <summary>
+        /// The resonant filter can boost a peak well past full scale. A hard
+        /// clamp folds those harmonics back as crackle; keep the signal
+        /// linear below the knee and roll the peaks off smoothly instead.
+        /// </summary>
+        private static double SoftLimit(double value)
+        {
+            const double knee = 0.70;
+            const double headroom = 1.0 - knee;
+            double magnitude = Math.Abs(value);
+
+            if (magnitude <= knee)
+                return value;
+
+            double limited =
+                knee + (headroom * Math.Tanh((magnitude - knee) / headroom));
+
+            return value < 0 ? -limited : limited;
         }
 
         private static int Waveform(Voice voice, int phase)

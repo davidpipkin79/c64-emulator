@@ -41,7 +41,7 @@ namespace C64Emulator.Tests
         }
 
         [Fact]
-        public void BasicRom_IsVisibleWhenHiramIsClear()
+        public void BasicRom_NeedsLoramAndHiram()
         {
             byte[] basic = new byte[AddressMap.BasicRomSize];
             basic[0] = 0x42;
@@ -54,8 +54,14 @@ namespace C64Emulator.Tests
             configured.Memory.Poke(0x0000, 0x07);
             configured.Memory.Poke(0x0001, 0x01); // HIRAM=0, LORAM=1, CHAREN=0
 
-            Assert.Equal(0x42, configured.Memory.Peek(0xA000));
+            // $34/$35 free the RAM at $A000-$BFFF and $E000-$FFFF while I/O
+            // stays visible, as on the 82S100 PLA: BASIC needs LORAM and HIRAM.
+            configured.Memory.Poke(0xA000, 0x5A);
+            Assert.Equal(0x5A, configured.Memory.Peek(0xA000));
             Assert.NotEqual(0x42, configured.Memory.Peek(0xE000));
+
+            configured.Memory.Poke(0x0001, 0x03); // HIRAM=1, LORAM=1
+            Assert.Equal(0x42, configured.Memory.Peek(0xA000));
         }
 
         [Fact]

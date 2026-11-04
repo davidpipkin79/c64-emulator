@@ -92,7 +92,32 @@ namespace C64Emulator.Tests
             int halfPeak = ReadAll(half).Max(sample => Math.Abs((int)sample));
 
             Assert.True(fullPeak > 500);
-            Assert.InRange((double)halfPeak / fullPeak, 0.45, 0.55);
+
+            // The taper is perceptual, so 50% is a quarter of the amplitude.
+            Assert.InRange((double)halfPeak / fullPeak, 0.20, 0.30);
+        }
+
+        [Fact]
+        public void HostVolume_FivePercent_IsFarQuieterThanFull()
+        {
+            SID full = new SID();
+            ConfigureSawVoice(full);
+
+            SID quiet = new SID();
+            ConfigureSawVoice(quiet);
+            quiet.OutputVolume = 5;
+
+            full.Clock(98_525);
+            quiet.Clock(98_525);
+
+            int fullPeak = ReadAll(full).Max(sample => Math.Abs((int)sample));
+            int quietPeak = ReadAll(quiet).Max(sample => Math.Abs((int)sample));
+
+            Assert.True(fullPeak > 500);
+
+            // 5% is 1/400 of the amplitude, about -52 dB: inaudible next to
+            // the music rather than merely quieter.
+            Assert.InRange((double)quietPeak / fullPeak, 0.0015, 0.004);
         }
 
         [Fact]

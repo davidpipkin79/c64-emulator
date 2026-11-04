@@ -555,6 +555,84 @@ namespace C64Emulator.Tests
         }
 
         [Fact]
+        public void TraceDotcSoundWrites()
+        {
+            const string diskPath =
+                @"C:\Users\david\Documents\My Projects\C64Roms\dotc-e.d64";
+            string romDirectory = GetRomDirectory();
+
+            using C64Machine machine = new C64Machine(
+                RomSet.Load(romDirectory),
+                File.ReadAllBytes(Path.Combine(romDirectory, "dos1541.rom")));
+
+            machine.TrueDriveEmulation = true;
+            machine.Drive.Mount(D64Image.Load(diskPath));
+            machine.Drive.Reset();
+            machine.Cpu.Reset();
+            WaitForReady(machine);
+
+            D64FileInfo file = machine.Drive.FindFile("DEFENDER OTC.+")!;
+            byte[] program = machine.Drive.ReadFile(file);
+            int address = program[0] | (program[1] << 8);
+            int length = program.Length - 2;
+
+            for (int i = 0; i < length; i++)
+                machine.Memory.Poke((ushort)(address + i), program[i + 2]);
+
+            int end = address + length - 1;
+            machine.Memory.Poke(0x2B, 0x01);
+            machine.Memory.Poke(0x2C, 0x08);
+            machine.Memory.Poke(0x2D, (byte)end);
+            machine.Memory.Poke(0x2E, (byte)(end >> 8));
+
+            Type(machine, "RUN");
+            Press(machine, Key.Return, ModifierKeys.None);
+
+            var byPc = new Dictionary<ushort, int>();
+            var byPort = new Dictionary<byte, int>();
+            var recent = new Queue<string>();
+            long total = 0;
+
+            machine.Sid.RegisterWriteHook = (register, value) =>
+            {
+                total++;
+                ushort pc = machine.Cpu.GetPC();
+                byte port = machine.Memory.Peek(0x0001);
+                byPc[pc] = byPc.TryGetValue(pc, out int n) ? n + 1 : 1;
+                byPort[port] = byPort.TryGetValue(port, out int p) ? p + 1 : 1;
+
+                if (recent.Count == 30)
+                    recent.Dequeue();
+
+                recent.Enqueue($"{pc:X4}/{port:X2}:{register:X2}={value:X2}");
+            };
+
+            for (int second = 1; second <= 260; second++)
+            {
+                machine.RunCycles(C64Machine.ClockHz);
+
+                string shadow = string.Concat(
+                    Enumerable.Range(0, 24).Select(
+                        i => machine.Memory.Read((ushort)(0xA851 + i)).ToString("X2")));
+
+                output.WriteLine(
+                    $"t={second} PC={machine.Cpu.GetPC():X4} " +
+                    $"JAM={machine.Cpu.IsJammed} 01={machine.Memory.Peek(0x01):X2} " +
+                    $"writes={total} " +
+                    $"ports={string.Join(",", byPort.OrderByDescending(kv => kv.Value).Take(4).Select(kv => $"{kv.Key:X2}:{kv.Value}"))} " +
+                    $"pcs={string.Join(",", byPc.OrderByDescending(kv => kv.Value).Take(4).Select(kv => $"{kv.Key:X4}:{kv.Value}"))} " +
+                    $"shadow={shadow} SID00={machine.Sid.GetRegister(0):X2} " +
+                    $"SID18={machine.Sid.GetRegister(0x18):X2} " +
+                    $"SCREEN={ReadScreenTail(machine.Memory)}");
+
+                if (machine.Cpu.IsJammed)
+                    break;
+            }
+
+            output.WriteLine("recent: " + string.Join(" ", recent));
+        }
+
+        [Fact]
         public void DecodeFirstDotcHeader()
         {
             const string diskPath =

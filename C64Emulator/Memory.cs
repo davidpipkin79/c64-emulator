@@ -34,6 +34,12 @@ namespace C64Emulator
 
         public Cartridge? Cartridge => cartridge;
 
+        /// <summary>
+        /// Diagnostic hook for writes into the music engine's state area. Set
+        /// by <see cref="SoundTrace"/> only when a table trace is requested.
+        /// </summary>
+        internal Action<ushort, byte>? TableWriteHook { get; set; }
+
         public void AttachCartridge(Cartridge? cart)
         {
             cartridge = cart;
@@ -59,6 +65,17 @@ namespace C64Emulator
 
         public void Poke(ushort address, byte value)
         {
+            // Diagnostic only: record who writes the music engine's state,
+            // including the zero-page note queue at $20-$29, so a trace shows
+            // whether the game ever asks for a note.
+            if (
+                (address is >= 0xA851 and <= 0xA8B2) ||
+                (address is >= 0x0020 and <= 0x0029) ||
+                (address is >= 0xDC00 and <= 0xDC0F))
+            {
+                TableWriteHook?.Invoke(address, value);
+            }
+
             if (IoVisible && address is >= AddressMap.IoStart and < AddressMap.IoEnd)
             {
                 io?.Poke((ushort)(address - AddressMap.IoStart), value);
@@ -85,11 +102,13 @@ namespace C64Emulator
                 if (hiram && address >= AddressMap.KernalRomStart)
                     return roms.Kernal[address - AddressMap.KernalRomStart];
 
-                // LORAM alone controls the BASIC overlay; HIRAM controls the
-                // KERNAL overlay. Keeping these independent fixes the
-                // HIRAM=0, LORAM=1 PLA configuration.
+                // As on the 82S100 PLA, BASIC needs LORAM *and* HIRAM. With
+                // $01=$35 (LORAM=1, HIRAM=0) the RAM at $A000-$BFFF stays
+                // visible, which is exactly the configuration Defender of the
+                // Crown's music player needs for its SID shadow at $A851.
                 if (
                     loram &&
+                    hiram &&
                     address >= AddressMap.BasicRomStart &&
                     address < AddressMap.BasicRomStart + AddressMap.BasicRomSize)
                 {
