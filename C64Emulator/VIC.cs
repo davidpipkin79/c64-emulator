@@ -55,14 +55,13 @@ namespace C64Emulator
 
         private const int FirstRasterLine = 9;
         private const int LastRasterLine = 293;
-        private const int FirstLinePixel = 76;
+        private const int FirstLinePixel = 96;
         private const int FirstDisplayLine = 48;
         private const int FirstScreenLine = 51;
         private const int LastScreenLine = 250;
         private const int FirstScreenPixel = 44;
         private const int LastScreenPixel = 363;
         private const int SpriteXOrigin = 20;
-        private const int SpriteYOrigin = 1;
 
         private readonly IVideoBus bus;
         private readonly ColorRam colorRam;
@@ -83,6 +82,15 @@ namespace C64Emulator
         private readonly byte[] glyphRow = new byte[40];
         private readonly bool[] spriteDmaActive = new bool[8];
         private readonly int[] spriteDmaRemaining = new int[8];
+        private readonly int[] spriteMemptr = new int[8];
+        private readonly bool[] spriteExpandFlip = new bool[8];
+
+        // Sprite data for the next raster line is fetched in the sprite's
+        // bus slots during the current line, then swapped in at the line
+        // boundary. The graphics bytes are latched the same way: fetched on
+        // their g-access cycle and displayed two cycles later.
+        private readonly byte[] spriteData = new byte[8 * 3];
+        private readonly byte[] spriteNextData = new byte[8 * 3];
         private int matrixRowStart;
         private int videoCounterBase;
         private bool denLatched;
@@ -117,6 +125,7 @@ namespace C64Emulator
         private int currentCycle;
         private int currentHLine;
         private int rasterIrqCountdown;
+        private bool borderFlipFlop;
 
         public VIC(IVideoBus bus, ColorRam colorRam, InterruptLine interrupts)
         {
@@ -183,9 +192,14 @@ namespace C64Emulator
             Array.Clear(glyphRow);
             Array.Clear(spriteDmaActive);
             Array.Clear(spriteDmaRemaining);
+            Array.Clear(spriteMemptr);
+            Array.Clear(spriteExpandFlip);
+            Array.Clear(spriteData);
+            Array.Clear(spriteNextData);
             matrixRowStart = 0;
             videoCounterBase = 0;
             denLatched = false;
+            borderFlipFlop = true;
 
             UpdateVideoMatrixAddress();
             UpdatePixelMatrixAddress();
@@ -585,7 +599,7 @@ namespace C64Emulator
                 Pixel spritePixel = GetSpritePixel(
                     sprite,
                     x - SpriteXOrigin,
-                    y - SpriteYOrigin);
+                    y);
 
                 if (spritePixel.Background)
                     continue;
@@ -633,15 +647,22 @@ namespace C64Emulator
 
         private Pixel GetBackgroundPixel(int x, int y)
         {
-            // The border aperture is fixed by CSEL/RSEL and applies to the
-            // output pixel. XSCROLL moves the source under that aperture; it
-            // must not widen the border or shrink the visible columns.
-            if (
-                !screenEnabled ||
-                y < firstScreenLine ||
-                y > lastScreenLine ||
-                x < firstScreenPixel ||
-                x > lastScreenPixel)
+            // The border is a flip-flop, not a fixed aperture. It opens at
+            // the left edge of the display window when DEN is set and the
+            // raster line is inside the window, and closes at the right edge.
+            // Clearing DEN mid-line closes it for the rest of the line even
+            // if DEN comes back, which is what border-opening tricks use.
+            if (!screenEnabled)
+                borderFlipFlop = true;
+            else if (
+                x == firstScreenPixel &&
+                y >= firstScreenLine &&
+                y <= lastScreenLine)
+                borderFlipFlop = false;
+            else if (x == lastScreenPixel + 1)
+                borderFlipFlop = true;
+
+            if (borderFlipFlop)
             {
                 return new Pixel
                 {
@@ -687,31 +708,28 @@ namespace C64Emulator
             if (
                 x < spriteState.X ||
                 x >= spriteState.X + spriteState.Width ||
-                y < spriteState.Y ||
-                y >= spriteState.Y + spriteState.Height)
+                y < spriteState.Y + 1 ||
+                y >= spriteState.Y + 1 + spriteState.Height)
             {
                 return emptyPixel;
             }
 
             int xOffset = x - spriteState.X;
-            int yOffset = y - spriteState.Y;
+            int yOffset = y - spriteState.Y - 1;
 
             xOffset /= spriteState.PixelScale;
 
             if (spriteState.Height == 42)
                 yOffset /= 2;
 
-            ushort pointerAddress = (ushort)(videoMatrixAddress + 0x3F8 + sprite);
-            ushort spritePixelAddress = (ushort)(bankAddress + bus.Read(pointerAddress) * 0x40);
-            ushort position = (ushort)((yOffset * 24 + xOffset) / 8);
+            // The three bytes shown on this raster line were fetched in the
+            // sprite's bus slots during the previous line.
+            byte value = spriteData[sprite * 3 + xOffset / 8];
             int bitPosition = 7 - (xOffset % 8);
-            byte value;
 
             if (spriteState.MulticolorMode)
             {
-                value = (byte)(
-                    (bus.Read((ushort)(spritePixelAddress + position)) >>
-                    ((bitPosition / 2) * 2)) & 0x03);
+                value = (byte)((value >> ((bitPosition / 2) * 2)) & 0x03);
 
                 return value switch
                 {
@@ -734,8 +752,7 @@ namespace C64Emulator
                 };
             }
 
-            value = (byte)(
-                (bus.Read((ushort)(spritePixelAddress + position)) >> bitPosition) & 0x01);
+            value = (byte)((value >> bitPosition) & 0x01);
 
             if (value == 0)
                 return emptyPixel;
@@ -894,22 +911,21 @@ namespace C64Emulator
 
         private void ProcessVideoCycle(int cycle)
         {
-            // The matrix/color fetch for the next character cell precedes the
-            // graphics fetch by one cycle. Screen column 0 starts at raster
-            // pixel 120 (cycle 15), so it uses a matrix byte fetched at 14 and
-            // a graphics byte fetched at 15.
-            if (lineIsBadline && cycle >= 14 && cycle <= 53)
-                FetchMatrixCell(cycle - 14);
-
-            if (cycle >= 15 && cycle <= 54)
+            // PAL 6569 access table. The 40 c-accesses run on cycles 15-54 in
+            // the VIC's second phase, which is what steals the CPU during a
+            // badline; the matching g-accesses follow one cycle later in the
+            // normal first phase (16-55). The fetched graphics byte reaches
+            // the shift register twelve pixels before it is displayed.
+            if (lineIsBadline && cycle >= 15 && cycle <= 54)
             {
-                FetchGlyphCell(cycle - 15);
-
-                // AEC is low for the badline's 40 C-access cycles. These are
-                // bus cycles the CPU does not get to use.
-                if (lineIsBadline)
-                    IncrementStolenCycles();
+                FetchMatrixCell(cycle - 15);
+                IncrementStolenCycles();
             }
+
+            if (cycle >= 16 && cycle <= 55)
+                FetchGlyphCell(cycle - 16);
+
+            FetchSpriteLine(cycle);
 
             if (SpriteStealsCycle(cycle))
                 IncrementStolenCycles();
@@ -930,6 +946,8 @@ namespace C64Emulator
 
         private void BeginRasterLine()
         {
+            borderFlipFlop = true;
+
             if (currentHLine == FirstDisplayLine)
             {
                 // DEN is sampled while raster $30 is active. VCBASE restarts
@@ -998,28 +1016,76 @@ namespace C64Emulator
 
         private void UpdateSpriteDma()
         {
+            // A sprite's data for raster line L is fetched in its bus slots
+            // during line L-1, so DMA has to be running one line before the
+            // first visible line. Each active line advances the sprite's
+            // 64-byte data block by one row (every other line when the sprite
+            // is Y-expanded) and the fetched bytes are latched for display.
             for (int sprite = 0; sprite < sprites.Length; sprite++)
             {
                 if (!sprites[sprite].Enabled)
                 {
                     spriteDmaActive[sprite] = false;
                     spriteDmaRemaining[sprite] = 0;
+                    spriteMemptr[sprite] = 0;
                     continue;
                 }
 
-                if (currentHLine == sprites[sprite].Y + SpriteYOrigin)
+                if (currentHLine == sprites[sprite].Y)
                 {
                     spriteDmaActive[sprite] = true;
                     spriteDmaRemaining[sprite] = Math.Max(0, sprites[sprite].Height - 1);
+                    spriteMemptr[sprite] = 0;
+                    spriteExpandFlip[sprite] = false;
                 }
                 else if (spriteDmaRemaining[sprite] > 0)
                 {
                     spriteDmaActive[sprite] = true;
                     spriteDmaRemaining[sprite]--;
+
+                    if (sprites[sprite].Height == 42)
+                    {
+                        spriteExpandFlip[sprite] = !spriteExpandFlip[sprite];
+
+                        if (!spriteExpandFlip[sprite])
+                            spriteMemptr[sprite] = (spriteMemptr[sprite] + 3) & 0x3F;
+                    }
+                    else
+                    {
+                        spriteMemptr[sprite] = (spriteMemptr[sprite] + 3) & 0x3F;
+                    }
                 }
                 else
                 {
                     spriteDmaActive[sprite] = false;
+                }
+            }
+
+            Array.Copy(spriteNextData, spriteData, spriteNextData.Length);
+        }
+
+        /// <summary>
+        /// Reads the three data bytes a sprite displays on the next raster
+        /// line when its fetch slot comes up. The pointer and the data block
+        /// are read once per line, exactly like the real chip, instead of
+        /// being re-read for every rendered pixel.
+        /// </summary>
+        private void FetchSpriteLine(int cycle)
+        {
+            for (int sprite = 0; sprite < sprites.Length; sprite++)
+            {
+                if (!spriteDmaActive[sprite] || cycle != GetSpriteFetchCycle(sprite))
+                    continue;
+
+                ushort pointerAddress = (ushort)(videoMatrixAddress + 0x3F8 + sprite);
+                ushort spriteBase = (ushort)(
+                    bankAddress + bus.Read(pointerAddress) * 0x40);
+                int memptr = spriteMemptr[sprite];
+
+                for (int i = 0; i < 3; i++)
+                {
+                    spriteNextData[sprite * 3 + i] = bus.Read(
+                        (ushort)(spriteBase + ((memptr + i) & 0x3F)));
                 }
             }
         }
@@ -1108,7 +1174,7 @@ namespace C64Emulator
                 : currentHLine + 1;
 
             return
-                nextLine == sprites[sprite].Y + SpriteYOrigin ||
+                nextLine == sprites[sprite].Y ||
                 spriteDmaRemaining[sprite] > 0;
         }
 

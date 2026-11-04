@@ -225,13 +225,22 @@ These are deliberately not presented as complete:
   not verified end to end.
 - Only standard 8K/16K CRT cartridges are supported. Banked cartridges,
   EasyFlash, Action Replay and REU expansion are not emulated.
-- VIC timing is cycle-staggered at scanline level rather than fully
-  cycle-exact. Individual CPU bus accesses are gated by BA/AEC: reads wait
-  during the lead-in, writes finish until AEC is asserted, and AEC blocks both.
-  Instructions are still executed atomically inside the core, so their
-  internal (non-bus) cycles are advanced as a block and stall placement can be
-  a cycle early or late. Sprite pointer/address quirks, border tricks and the
-  more obscure VIC bugs are not modeled.
+- The CPU issues every cycle in hardware order: opcode and operand fetches,
+  the unfixed dummy reads of indexed addressing, the read-modify-write dummy
+  write and the internal cycles of branches, stack and interrupt sequences.
+  Each one advances the machine one cycle, and BA/AEC is checked at the access
+  itself, so contention lands on the real cycle inside an instruction rather
+  than at its boundary. The SID is clocked per cycle for the same reason.
+- The VIC follows the PAL 6569 access table: the 40 c-accesses (video matrix
+  and Color RAM) run on cycles 15-54 in the VIC's second phase, the matching
+  g-accesses follow on 16-55, and the fetched byte reaches the screen twelve
+  pixels later from the shift-register stage. Sprite pointers and the three
+  bytes of a sprite row are fetched in the sprite bus slots and latched for
+  the next raster line instead of being read from memory while drawing, and
+  the border is a per-cycle flip-flop that opens at the display window edge.
+  Still approximate: refresh and idle accesses are not exposed on the bus, and
+  sprite collision timing follows the pixel pipeline rather than the sprite
+  output cycle.
 - The less common illegal 6502 opcodes are implemented approximately, and the
   unstable opcodes are not cycle-accurate.
 - The network protocol is the emulator's own host/client protocol, not a

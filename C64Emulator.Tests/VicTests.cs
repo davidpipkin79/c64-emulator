@@ -510,9 +510,12 @@ namespace C64Emulator.Tests
             vic.SetRegister(0x01, 50);   // sprite 0 starts on raster 51
             vic.SetRegister(0x03, 50);   // sprite 1 starts on raster 51
             vic.Tick(VIC.CyclesPerFrame);
-            vic.TakeStolenCycles();
 
+            // DMA starts on raster line 50, one line before the sprites are
+            // visible, so clear the counter at the start of line 51 rather
+            // than before the journey there.
             TickToCycle(vic, 51, 0);
+            vic.TakeStolenCycles();
             vic.Tick(63);
 
             // 40 badline cycles + 2 cycles for each of the two sprites.

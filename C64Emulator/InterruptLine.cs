@@ -99,6 +99,12 @@ namespace C64Emulator
         void Poke(ushort address, byte value);
 
         ushort PeekWord(ushort address);
+
+        /// <summary>
+        /// An internal CPU cycle. Buses that model timing use it to advance
+        /// the machine; a plain memory has nothing to do.
+        /// </summary>
+        void Idle();
     }
 
     /// <summary>

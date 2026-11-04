@@ -12,6 +12,12 @@ namespace C64Emulator
         void WaitForAccess(bool isWrite);
 
         void CompleteAccess();
+
+        /// <summary>
+        /// An internal (non-bus) CPU cycle: no value is read or written, but
+        /// the machine still advances one cycle so the VIC keeps fetching.
+        /// </summary>
+        void Idle();
     }
 
     /// <summary>
@@ -37,6 +43,11 @@ namespace C64Emulator
             byte value = bus.Peek(address);
             clock.CompleteAccess();
             return value;
+        }
+
+        public void Idle()
+        {
+            clock.Idle();
         }
 
         public void Poke(ushort address, byte value)

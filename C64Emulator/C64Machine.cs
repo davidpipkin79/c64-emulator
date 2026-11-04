@@ -476,27 +476,16 @@ namespace C64Emulator
         {
             cpuBusClock.Begin();
 
-            int cycles = StepCpuCore();
-
-            // The instruction helpers still execute atomically, but every
-            // actual bus access went through the clock above. Only the
-            // remaining internal (non-bus) cycles are advanced as a block.
-            int internalCycles = Math.Max(0, cycles - cpuBusClock.BusCycles);
-
-            for (int i = 0; i < internalCycles; i++)
-                TickBusCycle();
-
-            int elapsed = Math.Max(cycles, cpuBusClock.BusCycles) +
-                cpuBusClock.StallCycles;
+            // The core issues every cycle itself: reads, writes and internal
+            // cycles in the order the 6510 produces them. Stalls therefore
+            // land on the real access instead of being applied afterwards,
+            // and the clock's elapsed count includes the stalled cycles.
+            StepCpuCore();
+            int cycles = cpuBusClock.Elapsed;
 
             cpuBusClock.End();
 
-            // Advance the SID once per instruction rather than once per bus
-            // cycle. The accumulated cycle count preserves audio timing while
-            // avoiding a million tiny clock calls per second.
-            Sid.Clock(elapsed);
-
-            return elapsed;
+            return cycles;
         }
 
         private int StepCpuCore()
@@ -999,6 +988,11 @@ namespace C64Emulator
 
         private void TickBusCycle()
         {
+            // The SID advances on the same cycle as the access that can change
+            // its registers, so a write only affects the cycles after it
+            // instead of the whole instruction.
+            Sid.Clock(1);
+
             Cia1.ProcessTimers(1);
             Cia2.ProcessTimers(1);
 
@@ -1029,14 +1023,15 @@ namespace C64Emulator
                 this.machine = machine;
             }
 
-            public int BusCycles { get; private set; }
-
-            public int StallCycles { get; private set; }
+            /// <summary>
+            /// Machine cycles this instruction consumed, including the cycles
+            /// the VIC stole before an access was allowed.
+            /// </summary>
+            public int Elapsed { get; private set; }
 
             public void Begin()
             {
-                BusCycles = 0;
-                StallCycles = 0;
+                Elapsed = 0;
                 active = true;
             }
 
@@ -1045,16 +1040,21 @@ namespace C64Emulator
                 active = false;
             }
 
+            public void Idle()
+            {
+                if (!active)
+                    return;
+
+                Tick();
+            }
+
             public void WaitForAccess(bool isWrite)
             {
                 if (!active)
                     return;
 
                 while (!machine.Vic.IsCpuAccessAllowed(isWrite))
-                {
-                    machine.TickBusCycle();
-                    StallCycles++;
-                }
+                    Tick();
             }
 
             public void CompleteAccess()
@@ -1062,8 +1062,13 @@ namespace C64Emulator
                 if (!active)
                     return;
 
+                Tick();
+            }
+
+            private void Tick()
+            {
                 machine.TickBusCycle();
-                BusCycles++;
+                Elapsed++;
             }
         }
 

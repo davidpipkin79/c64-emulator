@@ -340,6 +340,11 @@ namespace C64Emulator
                     Peek(address) |
                     (Peek((ushort)(address + 1)) << 8));
             }
+
+            public void Idle()
+            {
+                // The drive's bus has no timing of its own to advance.
+            }
         }
     }
 }

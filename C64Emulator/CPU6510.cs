@@ -397,17 +397,62 @@ namespace C64Emulator
             return (registers.P & mask) == mask;
         }
 
+        /// <summary>
+        /// One CPU read cycle. Counting here instead of in the dispatch keeps
+        /// the instruction's cycle total equal to the cycles it actually
+        /// issued, including stalls.
+        /// </summary>
+        private byte read(ushort address)
+        {
+            cycles++;
+            return bus.Peek(address);
+        }
+
+        private void write(ushort address, byte value)
+        {
+            cycles++;
+            bus.Poke(address, value);
+        }
+
+        /// <summary>
+        /// An internal cycle. The 6510 does not commit a value, but the cycle
+        /// still occupies the bus, so the VIC keeps fetching while an
+        /// instruction is in flight.
+        /// </summary>
+        private void idle()
+        {
+            cycles++;
+            bus.Idle();
+        }
+
+        private void idle(int count)
+        {
+            for (int i = 0; i < count; i++)
+                idle();
+        }
+
+        /// <summary>
+        /// The NMOS 6502 reads with the carry of the index addition suppressed
+        /// before it reads the real address.
+        /// </summary>
+        private void readUnfixed(ushort baseAddress, ushort address)
+        {
+            read((ushort)((baseAddress & 0xFF00) | (address & 0x00FF)));
+        }
+
         private ushort peekWord(ushort address)
         {
-            return bus.PeekWord(address);
+            return (ushort)(
+                read(address) |
+                (read((ushort)(address + 1)) << 8));
         }
 
         private ushort peekWordZeroPage(byte address)
         {
             return
                 (ushort)(
-                bus.Peek(address) |
-                (bus.Peek((byte)(address + 1)) << 8)
+                read(address) |
+                (read((byte)(address + 1)) << 8)
                 );
         }
 
@@ -417,14 +462,14 @@ namespace C64Emulator
 
         private void stackPush(byte data)
         {
-            bus.Poke((ushort)(0x0100 + registers.S), data);
+            write((ushort)(0x0100 + registers.S), data);
             registers.S--;
         }
 
         private byte stackPull()
         {
             registers.S++;
-            return bus.Peek((ushort)(0x0100 + registers.S));
+            return read((ushort)(0x0100 + registers.S));
         }
 
         private void pushStatus(bool isBreak)
@@ -455,53 +500,94 @@ namespace C64Emulator
 
         private byte zeroPage()
         {
-            byte ret = bus.Peek(registers.PC);
+            byte ret = read(registers.PC);
             registers.PC++;
             return ret;
         }
 
         private byte zeroPageX()
         {
-            byte ret = (byte)(bus.Peek(registers.PC) + registers.X);
+            byte baseAddress = read(registers.PC);
             registers.PC++;
-            return ret;
+
+            // The ALU reads the unindexed zero-page address first.
+            read(baseAddress);
+            return (byte)(baseAddress + registers.X);
         }
 
         private byte zeroPageY()
         {
-            byte ret = (byte)(bus.Peek(registers.PC) + registers.Y);
+            byte baseAddress = read(registers.PC);
             registers.PC++;
-            return ret;
+
+            read(baseAddress);
+            return (byte)(baseAddress + registers.Y);
         }
 
         private ushort absolute()
         {
-            ushort ret = peekWord(registers.PC);
+            byte low = read(registers.PC);
+            byte high = read((ushort)(registers.PC + 1));
             registers.PC += 2;
-            return ret;
+            return (ushort)(low | (high << 8));
         }
 
         private ushort absoluteX(bool pageCheck)
         {
-            ushort baseAddress = peekWord(registers.PC);
+            byte low = read(registers.PC);
+            byte high = read((ushort)(registers.PC + 1));
+            registers.PC += 2;
+
+            ushort baseAddress = (ushort)(low | (high << 8));
             ushort address = (ushort)(baseAddress + registers.X);
 
+            // A read pays one extra cycle only when the index crosses a page:
+            // the dummy read at the unfixed address is the real read when it
+            // does not. Stores and read-modify-writes always pay for it.
             if (pageCheck && (baseAddress & 0xFF00) != (address & 0xFF00))
-                cycles++;
+                readUnfixed(baseAddress, address);
 
+            return address;
+        }
+
+        private ushort absoluteXForWrite()
+        {
+            byte low = read(registers.PC);
+            byte high = read((ushort)(registers.PC + 1));
             registers.PC += 2;
+
+            ushort baseAddress = (ushort)(low | (high << 8));
+            ushort address = (ushort)(baseAddress + registers.X);
+
+            readUnfixed(baseAddress, address);
             return address;
         }
 
         private ushort absoluteY(bool pageCheck)
         {
-            ushort baseAddress = peekWord(registers.PC);
+            byte low = read(registers.PC);
+            byte high = read((ushort)(registers.PC + 1));
+            registers.PC += 2;
+
+            ushort baseAddress = (ushort)(low | (high << 8));
             ushort address = (ushort)(baseAddress + registers.Y);
 
             if (pageCheck && (baseAddress & 0xFF00) != (address & 0xFF00))
-                cycles++;
+                readUnfixed(baseAddress, address);
 
+            return address;
+        }
+
+        private ushort absoluteYForWrite()
+        {
+            byte low = read(registers.PC);
+            byte high = read((ushort)(registers.PC + 1));
             registers.PC += 2;
+
+            ushort baseAddress = (ushort)(low | (high << 8));
+            ushort address = (ushort)(baseAddress + registers.Y);
+
+            readUnfixed(baseAddress, address);
             return address;
         }
 
@@ -511,8 +597,8 @@ namespace C64Emulator
             registers.PC += 2;
 
             // The NMOS 6502 wraps the high byte within the same page.
-            byte low = bus.Peek(pointer);
-            byte high = bus.Peek(
+            byte low = read(pointer);
+            byte high = read(
                 (ushort)((pointer & 0xFF00) | ((pointer + 1) & 0x00FF))
                 );
 
@@ -521,21 +607,38 @@ namespace C64Emulator
 
         private ushort indirectX()
         {
-            byte pointer = (byte)(bus.Peek(registers.PC) + registers.X);
+            byte pointer = read(registers.PC);
             registers.PC++;
-            return peekWordZeroPage(pointer);
+
+            // Dummy read at the unindexed pointer, then the pointer pair at
+            // the indexed zero-page address.
+            read(pointer);
+            return peekWordZeroPage((byte)(pointer + registers.X));
         }
 
         private ushort indirectY(bool pageCheck)
         {
-            byte pointer = bus.Peek(registers.PC);
+            byte pointer = read(registers.PC);
+            registers.PC++;
+
             ushort baseAddress = peekWordZeroPage(pointer);
             ushort address = (ushort)(baseAddress + registers.Y);
 
             if (pageCheck && (baseAddress & 0xFF00) != (address & 0xFF00))
-                cycles++;
+                readUnfixed(baseAddress, address);
 
+            return address;
+        }
+
+        private ushort indirectYForWrite()
+        {
+            byte pointer = read(registers.PC);
             registers.PC++;
+
+            ushort baseAddress = peekWordZeroPage(pointer);
+            ushort address = (ushort)(baseAddress + registers.Y);
+
+            readUnfixed(baseAddress, address);
             return address;
         }
 
@@ -546,20 +649,20 @@ namespace C64Emulator
         private void branch(StatusFlags flag, bool branchIfSet)
         {
             ushort nextInstruction = (ushort)(registers.PC + 1);
+            sbyte offset = (sbyte)read(registers.PC);
+            registers.PC = nextInstruction;
 
             if (getFlag(flag) != branchIfSet)
-            {
-                registers.PC = nextInstruction;
                 return;
-            }
 
-            ushort target =
-                (ushort)(nextInstruction + (sbyte)bus.Peek(registers.PC));
+            // A taken branch spends one internal cycle, and a second while the
+            // target is still in the wrong page.
+            idle();
 
-            cycles++;
+            ushort target = (ushort)(nextInstruction + offset);
 
             if ((target & 0xFF00) != (nextInstruction & 0xFF00))
-                cycles++;
+                readUnfixed(nextInstruction, target);
 
             registers.PC = target;
         }
@@ -580,8 +683,11 @@ namespace C64Emulator
 
         private void adc(ushort address)
         {
-            byte value = bus.Peek(address);
+            adcValue(read(address));
+        }
 
+        private void adcValue(byte value)
+        {
             if (getFlag(StatusFlags.D))
             {
                 adcDecimal(value);
@@ -634,8 +740,11 @@ namespace C64Emulator
 
         private void sbc(ushort address)
         {
-            byte value = bus.Peek(address);
+            sbcValue(read(address));
+        }
 
+        private void sbcValue(byte value)
+        {
             if (getFlag(StatusFlags.D))
             {
                 sbcDecimal(value);
@@ -686,14 +795,24 @@ namespace C64Emulator
 
         private void and(ushort address)
         {
-            registers.A &= bus.Peek(address);
+            andValue(read(address));
+        }
+
+        private void andValue(byte value)
+        {
+            registers.A &= value;
             setFlag(StatusFlags.Z, registers.A == 0);
             setFlag(StatusFlags.N, registers.A >= 0x80);
         }
 
         private void ora(ushort address)
         {
-            registers.A |= bus.Peek(address);
+            oraValue(read(address));
+        }
+
+        private void oraValue(byte value)
+        {
+            registers.A |= value;
             setFlag(StatusFlags.Z, registers.A == 0);
             setFlag(StatusFlags.N, registers.A >= 0x80);
         }
@@ -706,14 +825,26 @@ namespace C64Emulator
             setFlag(StatusFlags.N, registers.A >= 0x80);
         }
 
-        private void asl(ushort address)
+        // Read-modify-write instructions read the value, write the old value
+        // back (the NMOS dummy write), then write the result. The dummy write
+        // is a real bus cycle that a VIC fetch can stall.
+        private byte asl(ushort address)
         {
-            byte b = bus.Peek(address);
+            byte value = read(address);
+            byte result = aslValue(value);
+
+            write(address, value);
+            write(address, result);
+            return result;
+        }
+
+        private byte aslValue(byte b)
+        {
             setFlag(StatusFlags.C, (b & 0x80) != 0);
             b <<= 1;
-            bus.Poke(address, b);
             setFlag(StatusFlags.Z, b == 0);
             setFlag(StatusFlags.N, b >= 0x80);
+            return b;
         }
 
         private void rol()
@@ -726,16 +857,25 @@ namespace C64Emulator
             setFlag(StatusFlags.N, registers.A >= 0x80);
         }
 
-        private void rol(ushort address)
+        private byte rol(ushort address)
         {
-            byte b = bus.Peek(address);
+            byte value = read(address);
+            byte result = rolValue(value);
+
+            write(address, value);
+            write(address, result);
+            return result;
+        }
+
+        private byte rolValue(byte b)
+        {
             bool bit = getFlag(StatusFlags.C);
             setFlag(StatusFlags.C, (b & 0x80) != 0);
             b <<= 1;
             if (bit) b |= 0x01;
-            bus.Poke(address, b);
             setFlag(StatusFlags.Z, b == 0);
             setFlag(StatusFlags.N, b >= 0x80);
+            return b;
         }
 
         private void ror()
@@ -748,16 +888,25 @@ namespace C64Emulator
             setFlag(StatusFlags.N, registers.A >= 0x80);
         }
 
-        private void ror(ushort address)
+        private byte ror(ushort address)
         {
-            byte b = bus.Peek(address);
+            byte value = read(address);
+            byte result = rorValue(value);
+
+            write(address, value);
+            write(address, result);
+            return result;
+        }
+
+        private byte rorValue(byte b)
+        {
             bool bit = getFlag(StatusFlags.C);
             setFlag(StatusFlags.C, (b & 0x01) != 0);
             b >>= 1;
             if (bit) b |= 0x80;
-            bus.Poke(address, b);
             setFlag(StatusFlags.Z, b == 0);
             setFlag(StatusFlags.N, b >= 0x80);
+            return b;
         }
 
         private void lsr()
@@ -768,19 +917,28 @@ namespace C64Emulator
             setFlag(StatusFlags.N, false);
         }
 
-        private void lsr(ushort address)
+        private byte lsr(ushort address)
         {
-            byte b = bus.Peek(address);
+            byte value = read(address);
+            byte result = lsrValue(value);
+
+            write(address, value);
+            write(address, result);
+            return result;
+        }
+
+        private byte lsrValue(byte b)
+        {
             setFlag(StatusFlags.C, (b & 0x01) != 0);
             b >>= 1;
-            bus.Poke(address, b);
             setFlag(StatusFlags.Z, b == 0);
             setFlag(StatusFlags.N, false);
+            return b;
         }
 
         private void bit(ushort address)
         {
-            byte h = bus.Peek(address);
+            byte h = read(address);
             setFlag(StatusFlags.N, (h & 0x80) != 0);
             setFlag(StatusFlags.V, (h & 0x40) != 0);
             setFlag(StatusFlags.Z, (h & registers.A) == 0);
@@ -788,7 +946,12 @@ namespace C64Emulator
 
         private void cmp(ushort address)
         {
-            ushort h = (ushort)(registers.A - bus.Peek(address));
+            cmpValue(read(address));
+        }
+
+        private void cmpValue(byte value)
+        {
+            ushort h = (ushort)(registers.A - value);
             setFlag(StatusFlags.C, h <= 0xFF);
             setFlag(StatusFlags.Z, getLowByte(h) == 0);
             setFlag(StatusFlags.N, getLowByte(h) >= 0x80);
@@ -796,7 +959,7 @@ namespace C64Emulator
 
         private void cpx(ushort address)
         {
-            ushort h = (ushort)(registers.X - bus.Peek(address));
+            ushort h = (ushort)(registers.X - read(address));
             setFlag(StatusFlags.C, h <= 0xFF);
             setFlag(StatusFlags.Z, getLowByte(h) == 0);
             setFlag(StatusFlags.N, getLowByte(h) >= 0x80);
@@ -804,18 +967,28 @@ namespace C64Emulator
 
         private void cpy(ushort address)
         {
-            ushort h = (ushort)(registers.Y - bus.Peek(address));
+            ushort h = (ushort)(registers.Y - read(address));
             setFlag(StatusFlags.C, h <= 0xFF);
             setFlag(StatusFlags.Z, getLowByte(h) == 0);
             setFlag(StatusFlags.N, getLowByte(h) >= 0x80);
         }
 
-        private void dec(ushort address)
+        private byte dec(ushort address)
         {
-            ushort h = (ushort)(bus.Peek(address) - 1);
-            bus.Poke(address, getLowByte(h));
-            setFlag(StatusFlags.Z, getLowByte(h) == 0);
-            setFlag(StatusFlags.N, getLowByte(h) >= 0x80);
+            byte value = read(address);
+            byte result = decValue(value);
+
+            write(address, value);
+            write(address, result);
+            return result;
+        }
+
+        private byte decValue(byte value)
+        {
+            byte result = (byte)(value - 1);
+            setFlag(StatusFlags.Z, result == 0);
+            setFlag(StatusFlags.N, result >= 0x80);
+            return result;
         }
 
         private void dex()
@@ -836,17 +1009,32 @@ namespace C64Emulator
 
         private void eor(ushort address)
         {
-            registers.A ^= bus.Peek(address);
+            eorValue(read(address));
+        }
+
+        private void eorValue(byte value)
+        {
+            registers.A ^= value;
             setFlag(StatusFlags.Z, registers.A == 0);
             setFlag(StatusFlags.N, registers.A >= 0x80);
         }
 
-        private void inc(ushort address)
+        private byte inc(ushort address)
         {
-            ushort h = (ushort)(bus.Peek(address) + 1);
-            bus.Poke(address, getLowByte(h));
-            setFlag(StatusFlags.Z, getLowByte(h) == 0);
-            setFlag(StatusFlags.N, getLowByte(h) >= 0x80);
+            byte value = read(address);
+            byte result = incValue(value);
+
+            write(address, value);
+            write(address, result);
+            return result;
+        }
+
+        private byte incValue(byte value)
+        {
+            byte result = (byte)(value + 1);
+            setFlag(StatusFlags.Z, result == 0);
+            setFlag(StatusFlags.N, result >= 0x80);
+            return result;
         }
 
         private void inx()
@@ -870,45 +1058,63 @@ namespace C64Emulator
             registers.PC = address;
         }
 
-        private void jsr(ushort address)
+        /// <summary>
+        /// JSR reads its low operand, spends an internal cycle, pushes the
+        /// return address, then fetches the high operand on its last cycle.
+        /// </summary>
+        private void jsr()
         {
-            registers.PC--;
-            stackPush(getHighByte(registers.PC));
-            stackPush(getLowByte(registers.PC));
-            registers.PC = address;
+            byte low = read(registers.PC);
+            idle();
+
+            ushort returnAddress = (ushort)(registers.PC + 1);
+            stackPush(getHighByte(returnAddress));
+            stackPush(getLowByte(returnAddress));
+
+            byte high = read((ushort)(registers.PC + 1));
+            registers.PC = (ushort)(low | (high << 8));
         }
 
         private void rts()
         {
-            setLowByte(ref registers.PC, stackPull());
-            setHighByte(ref registers.PC, stackPull());
-            registers.PC++;
+            idle();
+            idle();
+
+            byte low = stackPull();
+            byte high = stackPull();
+            registers.PC = (ushort)((low | (high << 8)) + 1);
+
+            idle();
         }
 
         private void rti()
         {
+            idle();
+            idle();
+
             pullStatus();
-            setLowByte(ref registers.PC, stackPull());
-            setHighByte(ref registers.PC, stackPull());
+            byte low = stackPull();
+            byte high = stackPull();
+            registers.PC = (ushort)(low | (high << 8));
         }
 
         private void lda(ushort address)
         {
-            registers.A = bus.Peek(address);
+            registers.A = read(address);
             setFlag(StatusFlags.Z, registers.A == 0);
             setFlag(StatusFlags.N, registers.A >= 0x80);
         }
 
         private void ldx(ushort address)
         {
-            registers.X = bus.Peek(address);
+            registers.X = read(address);
             setFlag(StatusFlags.Z, registers.X == 0);
             setFlag(StatusFlags.N, registers.X >= 0x80);
         }
 
         private void ldy(ushort address)
         {
-            registers.Y = bus.Peek(address);
+            registers.Y = read(address);
             setFlag(StatusFlags.Z, registers.Y == 0);
             setFlag(StatusFlags.N, registers.Y >= 0x80);
         }
@@ -922,17 +1128,17 @@ namespace C64Emulator
 
         private void sta(ushort address)
         {
-            bus.Poke(address, registers.A);
+            write(address, registers.A);
         }
 
         private void stx(ushort address)
         {
-            bus.Poke(address, registers.X);
+            write(address, registers.X);
         }
 
         private void sty(ushort address)
         {
-            bus.Poke(address, registers.Y);
+            write(address, registers.Y);
         }
 
         private void tax()
@@ -981,7 +1187,11 @@ namespace C64Emulator
 
         private void brk()
         {
+            // BRK reads the padding byte, pushes PC and status, then reads the
+            // IRQ vector.
+            read(registers.PC);
             registers.PC++;
+
             stackPush(getHighByte(registers.PC));
             stackPush(getLowByte(registers.PC));
             pushStatus(true);
@@ -994,6 +1204,9 @@ namespace C64Emulator
             if (getFlag(StatusFlags.I))
                 return;
 
+            idle();
+            idle();
+
             stackPush(getHighByte(registers.PC));
             stackPush(getLowByte(registers.PC));
             pushStatus(false);
@@ -1003,6 +1216,9 @@ namespace C64Emulator
 
         private void nmi()
         {
+            idle();
+            idle();
+
             stackPush(getHighByte(registers.PC));
             stackPush(getLowByte(registers.PC));
             pushStatus(false);
@@ -1018,6 +1234,9 @@ namespace C64Emulator
         /// </summary>
         public int ReturnFromSubroutine()
         {
+            // The machine intercepts a JSR entry, so charge its fetch cycle
+            // before completing the call with an RTS.
+            idle();
             rts();
             return 6;
         }
@@ -1025,7 +1244,7 @@ namespace C64Emulator
         public void Reset()
         {
             jammed = false;
-            registers.PC = peekWord(AddressMap.ResetVector);
+            registers.PC = bus.PeekWord(AddressMap.ResetVector);
             setFlag(StatusFlags.I, true);
         }
 
@@ -1048,261 +1267,261 @@ namespace C64Emulator
             {
                 interrupts.AcknowledgeNmi();
                 nmi();
-                return cycles = 7;
+                return cycles;
             }
 
             if (interrupts.IsIrqAsserted && !getFlag(StatusFlags.I))
             {
                 irq();
-                return cycles = 7;
+                return cycles;
             }
 
-            byte instruction = bus.Peek(registers.PC);
+            byte instruction = read(registers.PC);
             registers.PC++;
             ushort address = 0;
 
             switch ((Instructions)instruction)
             {
                 // ADC
-                case Instructions.ADC_imm: cycles += 2; adc(immediate()); break;
-                case Instructions.ADC_zp: cycles += 3; adc(zeroPage()); break;
-                case Instructions.ADC_zpx: cycles += 4; adc(zeroPageX()); break;
-                case Instructions.ADC_abs: cycles += 4; adc(absolute()); break;
-                case Instructions.ADC_abx: cycles += 4; adc(absoluteX(true)); break;
-                case Instructions.ADC_aby: cycles += 4; adc(absoluteY(true)); break;
-                case Instructions.ADC_izx: cycles += 6; adc(indirectX()); break;
-                case Instructions.ADC_izy: cycles += 5; adc(indirectY(true)); break;
+                case Instructions.ADC_imm: adc(immediate()); break;
+                case Instructions.ADC_zp: adc(zeroPage()); break;
+                case Instructions.ADC_zpx: adc(zeroPageX()); break;
+                case Instructions.ADC_abs: adc(absolute()); break;
+                case Instructions.ADC_abx: adc(absoluteX(true)); break;
+                case Instructions.ADC_aby: adc(absoluteY(true)); break;
+                case Instructions.ADC_izx: adc(indirectX()); break;
+                case Instructions.ADC_izy: adc(indirectY(true)); break;
 
                 // SBC
                 case Instructions.SBC_imm:
                 case Instructions.SBC:
-                    cycles += 2; sbc(immediate()); break;
-                case Instructions.SBC_zp: cycles += 3; sbc(zeroPage()); break;
-                case Instructions.SBC_zpx: cycles += 4; sbc(zeroPageX()); break;
-                case Instructions.SBC_abs: cycles += 4; sbc(absolute()); break;
-                case Instructions.SBC_abx: cycles += 4; sbc(absoluteX(true)); break;
-                case Instructions.SBC_aby: cycles += 4; sbc(absoluteY(true)); break;
-                case Instructions.SBC_izx: cycles += 6; sbc(indirectX()); break;
-                case Instructions.SBC_izy: cycles += 5; sbc(indirectY(true)); break;
+                    sbc(immediate()); break;
+                case Instructions.SBC_zp: sbc(zeroPage()); break;
+                case Instructions.SBC_zpx: sbc(zeroPageX()); break;
+                case Instructions.SBC_abs: sbc(absolute()); break;
+                case Instructions.SBC_abx: sbc(absoluteX(true)); break;
+                case Instructions.SBC_aby: sbc(absoluteY(true)); break;
+                case Instructions.SBC_izx: sbc(indirectX()); break;
+                case Instructions.SBC_izy: sbc(indirectY(true)); break;
 
                 // AND
-                case Instructions.AND_imm: cycles += 2; and(immediate()); break;
-                case Instructions.AND_zp: cycles += 3; and(zeroPage()); break;
-                case Instructions.AND_zpx: cycles += 4; and(zeroPageX()); break;
-                case Instructions.AND_abs: cycles += 4; and(absolute()); break;
-                case Instructions.AND_abx: cycles += 4; and(absoluteX(true)); break;
-                case Instructions.AND_aby: cycles += 4; and(absoluteY(true)); break;
-                case Instructions.AND_izx: cycles += 6; and(indirectX()); break;
-                case Instructions.AND_izy: cycles += 5; and(indirectY(true)); break;
+                case Instructions.AND_imm: and(immediate()); break;
+                case Instructions.AND_zp: and(zeroPage()); break;
+                case Instructions.AND_zpx: and(zeroPageX()); break;
+                case Instructions.AND_abs: and(absolute()); break;
+                case Instructions.AND_abx: and(absoluteX(true)); break;
+                case Instructions.AND_aby: and(absoluteY(true)); break;
+                case Instructions.AND_izx: and(indirectX()); break;
+                case Instructions.AND_izy: and(indirectY(true)); break;
 
                 // ORA
-                case Instructions.ORA_imm: cycles += 2; ora(immediate()); break;
-                case Instructions.ORA_zp: cycles += 3; ora(zeroPage()); break;
-                case Instructions.ORA_zpx: cycles += 4; ora(zeroPageX()); break;
-                case Instructions.ORA_abs: cycles += 4; ora(absolute()); break;
-                case Instructions.ORA_abx: cycles += 4; ora(absoluteX(true)); break;
-                case Instructions.ORA_aby: cycles += 4; ora(absoluteY(true)); break;
-                case Instructions.ORA_izx: cycles += 6; ora(indirectX()); break;
-                case Instructions.ORA_izy: cycles += 5; ora(indirectY(true)); break;
+                case Instructions.ORA_imm: ora(immediate()); break;
+                case Instructions.ORA_zp: ora(zeroPage()); break;
+                case Instructions.ORA_zpx: ora(zeroPageX()); break;
+                case Instructions.ORA_abs: ora(absolute()); break;
+                case Instructions.ORA_abx: ora(absoluteX(true)); break;
+                case Instructions.ORA_aby: ora(absoluteY(true)); break;
+                case Instructions.ORA_izx: ora(indirectX()); break;
+                case Instructions.ORA_izy: ora(indirectY(true)); break;
 
                 // ASL
-                case Instructions.ASL_imp: cycles += 2; asl(); break;
-                case Instructions.ASL_zp: cycles += 5; asl(zeroPage()); break;
-                case Instructions.ASL_zpx: cycles += 6; asl(zeroPageX()); break;
-                case Instructions.ASL_abs: cycles += 6; asl(absolute()); break;
-                case Instructions.ASL_abx: cycles += 7; asl(absoluteX(false)); break;
+                case Instructions.ASL_imp: idle(); asl(); break;
+                case Instructions.ASL_zp: asl(zeroPage()); break;
+                case Instructions.ASL_zpx: asl(zeroPageX()); break;
+                case Instructions.ASL_abs: asl(absolute()); break;
+                case Instructions.ASL_abx: asl(absoluteXForWrite()); break;
 
                 // ROL
-                case Instructions.ROL_imp: cycles += 2; rol(); break;
-                case Instructions.ROL_zp: cycles += 5; rol(zeroPage()); break;
-                case Instructions.ROL_zpx: cycles += 6; rol(zeroPageX()); break;
-                case Instructions.ROL_abs: cycles += 6; rol(absolute()); break;
-                case Instructions.ROL_abx: cycles += 7; rol(absoluteX(false)); break;
+                case Instructions.ROL_imp: idle(); rol(); break;
+                case Instructions.ROL_zp: rol(zeroPage()); break;
+                case Instructions.ROL_zpx: rol(zeroPageX()); break;
+                case Instructions.ROL_abs: rol(absolute()); break;
+                case Instructions.ROL_abx: rol(absoluteXForWrite()); break;
 
                 // ROR
-                case Instructions.ROR_imp: cycles += 2; ror(); break;
-                case Instructions.ROR_zp: cycles += 5; ror(zeroPage()); break;
-                case Instructions.ROR_zpx: cycles += 6; ror(zeroPageX()); break;
-                case Instructions.ROR_abs: cycles += 6; ror(absolute()); break;
-                case Instructions.ROR_abx: cycles += 7; ror(absoluteX(false)); break;
+                case Instructions.ROR_imp: idle(); ror(); break;
+                case Instructions.ROR_zp: ror(zeroPage()); break;
+                case Instructions.ROR_zpx: ror(zeroPageX()); break;
+                case Instructions.ROR_abs: ror(absolute()); break;
+                case Instructions.ROR_abx: ror(absoluteXForWrite()); break;
 
                 // LSR
-                case Instructions.LSR_imp: cycles += 2; lsr(); break;
-                case Instructions.LSR_zp: cycles += 5; lsr(zeroPage()); break;
-                case Instructions.LSR_zpx: cycles += 6; lsr(zeroPageX()); break;
-                case Instructions.LSR_abs: cycles += 6; lsr(absolute()); break;
-                case Instructions.LSR_abx: cycles += 7; lsr(absoluteX(false)); break;
+                case Instructions.LSR_imp: idle(); lsr(); break;
+                case Instructions.LSR_zp: lsr(zeroPage()); break;
+                case Instructions.LSR_zpx: lsr(zeroPageX()); break;
+                case Instructions.LSR_abs: lsr(absolute()); break;
+                case Instructions.LSR_abx: lsr(absoluteXForWrite()); break;
 
                 // BIT
-                case Instructions.BIT_zp: cycles += 3; bit(zeroPage()); break;
-                case Instructions.BIT_abs: cycles += 4; bit(absolute()); break;
+                case Instructions.BIT_zp: bit(zeroPage()); break;
+                case Instructions.BIT_abs: bit(absolute()); break;
 
                 // BRK
-                case Instructions.BRK: cycles += 7; brk(); break;
+                case Instructions.BRK: brk(); break;
 
                 // CMP
-                case Instructions.CMP_imm: cycles += 2; cmp(immediate()); break;
-                case Instructions.CMP_zp: cycles += 3; cmp(zeroPage()); break;
-                case Instructions.CMP_zpx: cycles += 4; cmp(zeroPageX()); break;
-                case Instructions.CMP_abs: cycles += 4; cmp(absolute()); break;
-                case Instructions.CMP_abx: cycles += 4; cmp(absoluteX(true)); break;
-                case Instructions.CMP_aby: cycles += 4; cmp(absoluteY(true)); break;
-                case Instructions.CMP_izx: cycles += 6; cmp(indirectX()); break;
-                case Instructions.CMP_izy: cycles += 5; cmp(indirectY(true)); break;
+                case Instructions.CMP_imm: cmp(immediate()); break;
+                case Instructions.CMP_zp: cmp(zeroPage()); break;
+                case Instructions.CMP_zpx: cmp(zeroPageX()); break;
+                case Instructions.CMP_abs: cmp(absolute()); break;
+                case Instructions.CMP_abx: cmp(absoluteX(true)); break;
+                case Instructions.CMP_aby: cmp(absoluteY(true)); break;
+                case Instructions.CMP_izx: cmp(indirectX()); break;
+                case Instructions.CMP_izy: cmp(indirectY(true)); break;
 
                 // CPX
-                case Instructions.CPX_imm: cycles += 2; cpx(immediate()); break;
-                case Instructions.CPX_zp: cycles += 3; cpx(zeroPage()); break;
-                case Instructions.CPX_abs: cycles += 4; cpx(absolute()); break;
+                case Instructions.CPX_imm: cpx(immediate()); break;
+                case Instructions.CPX_zp: cpx(zeroPage()); break;
+                case Instructions.CPX_abs: cpx(absolute()); break;
 
                 // CPY
-                case Instructions.CPY_imm: cycles += 2; cpy(immediate()); break;
-                case Instructions.CPY_zp: cycles += 3; cpy(zeroPage()); break;
-                case Instructions.CPY_abs: cycles += 4; cpy(absolute()); break;
+                case Instructions.CPY_imm: cpy(immediate()); break;
+                case Instructions.CPY_zp: cpy(zeroPage()); break;
+                case Instructions.CPY_abs: cpy(absolute()); break;
 
                 // DEC
-                case Instructions.DEC_zp: cycles += 5; dec(zeroPage()); break;
-                case Instructions.DEC_zpx: cycles += 6; dec(zeroPageX()); break;
-                case Instructions.DEC_abs: cycles += 6; dec(absolute()); break;
-                case Instructions.DEC_abx: cycles += 7; dec(absoluteX(false)); break;
+                case Instructions.DEC_zp: dec(zeroPage()); break;
+                case Instructions.DEC_zpx: dec(zeroPageX()); break;
+                case Instructions.DEC_abs: dec(absolute()); break;
+                case Instructions.DEC_abx: dec(absoluteXForWrite()); break;
 
                 // DEX
-                case Instructions.DEX: cycles += 2; dex(); break;
+                case Instructions.DEX: idle(); dex(); break;
 
                 // DEY
-                case Instructions.DEY: cycles += 2; dey(); break;
+                case Instructions.DEY: idle(); dey(); break;
 
                 // EOR
-                case Instructions.EOR_imm: cycles += 2; eor(immediate()); break;
-                case Instructions.EOR_zp: cycles += 3; eor(zeroPage()); break;
-                case Instructions.EOR_zpx: cycles += 4; eor(zeroPageX()); break;
-                case Instructions.EOR_abs: cycles += 4; eor(absolute()); break;
-                case Instructions.EOR_abx: cycles += 4; eor(absoluteX(true)); break;
-                case Instructions.EOR_aby: cycles += 4; eor(absoluteY(true)); break;
-                case Instructions.EOR_izx: cycles += 6; eor(indirectX()); break;
-                case Instructions.EOR_izy: cycles += 5; eor(indirectY(true)); break;
+                case Instructions.EOR_imm: eor(immediate()); break;
+                case Instructions.EOR_zp: eor(zeroPage()); break;
+                case Instructions.EOR_zpx: eor(zeroPageX()); break;
+                case Instructions.EOR_abs: eor(absolute()); break;
+                case Instructions.EOR_abx: eor(absoluteX(true)); break;
+                case Instructions.EOR_aby: eor(absoluteY(true)); break;
+                case Instructions.EOR_izx: eor(indirectX()); break;
+                case Instructions.EOR_izy: eor(indirectY(true)); break;
 
                 // INC
-                case Instructions.INC_zp: cycles += 5; inc(zeroPage()); break;
-                case Instructions.INC_zpx: cycles += 6; inc(zeroPageX()); break;
-                case Instructions.INC_abs: cycles += 6; inc(absolute()); break;
-                case Instructions.INC_abx: cycles += 7; inc(absoluteX(false)); break;
+                case Instructions.INC_zp: inc(zeroPage()); break;
+                case Instructions.INC_zpx: inc(zeroPageX()); break;
+                case Instructions.INC_abs: inc(absolute()); break;
+                case Instructions.INC_abx: inc(absoluteXForWrite()); break;
 
                 // INX
-                case Instructions.INX: cycles += 2; inx(); break;
+                case Instructions.INX: idle(); inx(); break;
 
                 // INY
-                case Instructions.INY: cycles += 2; iny(); break;
+                case Instructions.INY: idle(); iny(); break;
 
                 // JMP
-                case Instructions.JMP_abs: cycles += 3; jmp(absolute()); break;
-                case Instructions.JMP_ind: cycles += 5; jmp(indirect()); break;
+                case Instructions.JMP_abs: jmp(absolute()); break;
+                case Instructions.JMP_ind: jmp(indirect()); break;
 
                 // JSR
-                case Instructions.JSR: cycles += 6; jsr(absolute()); break;
+                case Instructions.JSR: jsr(); break;
 
                 // RTS
-                case Instructions.RTS: cycles += 6; rts(); break;
+                case Instructions.RTS: rts(); break;
 
                 // RTI
-                case Instructions.RTI: cycles += 6; rti(); break;
+                case Instructions.RTI: rti(); break;
 
                 // LDA
-                case Instructions.LDA_imm: cycles += 2; lda(immediate()); break;
-                case Instructions.LDA_zp: cycles += 3; lda(zeroPage()); break;
-                case Instructions.LDA_zpx: cycles += 4; lda(zeroPageX()); break;
-                case Instructions.LDA_abs: cycles += 4; lda(absolute()); break;
-                case Instructions.LDA_abx: cycles += 4; lda(absoluteX(true)); break;
-                case Instructions.LDA_aby: cycles += 4; lda(absoluteY(true)); break;
-                case Instructions.LDA_izx: cycles += 6; lda(indirectX()); break;
-                case Instructions.LDA_izy: cycles += 5; lda(indirectY(true)); break;
+                case Instructions.LDA_imm: lda(immediate()); break;
+                case Instructions.LDA_zp: lda(zeroPage()); break;
+                case Instructions.LDA_zpx: lda(zeroPageX()); break;
+                case Instructions.LDA_abs: lda(absolute()); break;
+                case Instructions.LDA_abx: lda(absoluteX(true)); break;
+                case Instructions.LDA_aby: lda(absoluteY(true)); break;
+                case Instructions.LDA_izx: lda(indirectX()); break;
+                case Instructions.LDA_izy: lda(indirectY(true)); break;
 
                 // LDX
-                case Instructions.LDX_imm: cycles += 2; ldx(immediate()); break;
-                case Instructions.LDX_zp: cycles += 3; ldx(zeroPage()); break;
-                case Instructions.LDX_zpy: cycles += 4; ldx(zeroPageY()); break;
-                case Instructions.LDX_abs: cycles += 4; ldx(absolute()); break;
-                case Instructions.LDX_aby: cycles += 4; ldx(absoluteY(true)); break;
+                case Instructions.LDX_imm: ldx(immediate()); break;
+                case Instructions.LDX_zp: ldx(zeroPage()); break;
+                case Instructions.LDX_zpy: ldx(zeroPageY()); break;
+                case Instructions.LDX_abs: ldx(absolute()); break;
+                case Instructions.LDX_aby: ldx(absoluteY(true)); break;
 
                 // LDY
-                case Instructions.LDY_imm: cycles += 2; ldy(immediate()); break;
-                case Instructions.LDY_zp: cycles += 3; ldy(zeroPage()); break;
-                case Instructions.LDY_zpx: cycles += 4; ldy(zeroPageX()); break;
-                case Instructions.LDY_abs: cycles += 4; ldy(absolute()); break;
-                case Instructions.LDY_abx: cycles += 4; ldy(absoluteX(true)); break;
+                case Instructions.LDY_imm: ldy(immediate()); break;
+                case Instructions.LDY_zp: ldy(zeroPage()); break;
+                case Instructions.LDY_zpx: ldy(zeroPageX()); break;
+                case Instructions.LDY_abs: ldy(absolute()); break;
+                case Instructions.LDY_abx: ldy(absoluteX(true)); break;
 
                 // STA
-                case Instructions.STA_zp: cycles += 3; sta(zeroPage()); break;
-                case Instructions.STA_zpx: cycles += 4; sta(zeroPageX()); break;
-                case Instructions.STA_abs: cycles += 4; sta(absolute()); break;
-                case Instructions.STA_abx: cycles += 5; sta(absoluteX(false)); break;
-                case Instructions.STA_aby: cycles += 5; sta(absoluteY(false)); break;
-                case Instructions.STA_izx: cycles += 6; sta(indirectX()); break;
-                case Instructions.STA_izy: cycles += 6; sta(indirectY(false)); break;
+                case Instructions.STA_zp: sta(zeroPage()); break;
+                case Instructions.STA_zpx: sta(zeroPageX()); break;
+                case Instructions.STA_abs: sta(absolute()); break;
+                case Instructions.STA_abx: sta(absoluteXForWrite()); break;
+                case Instructions.STA_aby: sta(absoluteYForWrite()); break;
+                case Instructions.STA_izx: sta(indirectX()); break;
+                case Instructions.STA_izy: sta(indirectYForWrite()); break;
 
                 // STX
-                case Instructions.STX_zp: cycles += 3; stx(zeroPage()); break;
-                case Instructions.STX_zpy: cycles += 4; stx(zeroPageY()); break;
-                case Instructions.STX_abs: cycles += 4; stx(absolute()); break;
+                case Instructions.STX_zp: stx(zeroPage()); break;
+                case Instructions.STX_zpy: stx(zeroPageY()); break;
+                case Instructions.STX_abs: stx(absolute()); break;
 
                 // STY
-                case Instructions.STY_zp: cycles += 3; sty(zeroPage()); break;
-                case Instructions.STY_zpx: cycles += 4; sty(zeroPageX()); break;
-                case Instructions.STY_abs: cycles += 4; sty(absolute()); break;
+                case Instructions.STY_zp: sty(zeroPage()); break;
+                case Instructions.STY_zpx: sty(zeroPageX()); break;
+                case Instructions.STY_abs: sty(absolute()); break;
 
                 // TAX
-                case Instructions.TAX: cycles += 2; tax(); break;
+                case Instructions.TAX: idle(); tax(); break;
 
                 // TAY
-                case Instructions.TAY: cycles += 2; tay(); break;
+                case Instructions.TAY: idle(); tay(); break;
 
                 // TSX
-                case Instructions.TSX: cycles += 2; tsx(); break;
+                case Instructions.TSX: idle(); tsx(); break;
 
                 // TXA
-                case Instructions.TXA: cycles += 2; txa(); break;
+                case Instructions.TXA: idle(); txa(); break;
 
                 // TXS
-                case Instructions.TXS: cycles += 2; txs(); break;
+                case Instructions.TXS: idle(); txs(); break;
 
                 // TYA
-                case Instructions.TYA: cycles += 2; tya(); break;
+                case Instructions.TYA: idle(); tya(); break;
 
                 // CLC
-                case Instructions.CLC: cycles += 2; setFlag(StatusFlags.C, false); break;
+                case Instructions.CLC: idle(); setFlag(StatusFlags.C, false); break;
 
                 // CLD
-                case Instructions.CLD: cycles += 2; setFlag(StatusFlags.D, false); break;
+                case Instructions.CLD: idle(); setFlag(StatusFlags.D, false); break;
 
                 // CLI
-                case Instructions.CLI: cycles += 2; setFlag(StatusFlags.I, false); break;
+                case Instructions.CLI: idle(); setFlag(StatusFlags.I, false); break;
 
                 // CLV
-                case Instructions.CLV: cycles += 2; setFlag(StatusFlags.V, false); break;
+                case Instructions.CLV: idle(); setFlag(StatusFlags.V, false); break;
 
                 // BCC
-                case Instructions.BCC: cycles += 2; bfc(StatusFlags.C); break;
+                case Instructions.BCC: bfc(StatusFlags.C); break;
 
                 // BCS
-                case Instructions.BCS: cycles += 2; bfs(StatusFlags.C); break;
+                case Instructions.BCS: bfs(StatusFlags.C); break;
 
                 // BEQ
-                case Instructions.BEQ: cycles += 2; bfs(StatusFlags.Z); break;
+                case Instructions.BEQ: bfs(StatusFlags.Z); break;
 
                 // BMI
-                case Instructions.BMI: cycles += 2; bfs(StatusFlags.N); break;
+                case Instructions.BMI: bfs(StatusFlags.N); break;
 
                 // BNE
-                case Instructions.BNE: cycles += 2; bfc(StatusFlags.Z); break;
+                case Instructions.BNE: bfc(StatusFlags.Z); break;
 
                 // BPL
-                case Instructions.BPL: cycles += 2; bfc(StatusFlags.N); break;
+                case Instructions.BPL: bfc(StatusFlags.N); break;
 
                 // BVC
-                case Instructions.BVC: cycles += 2; bfc(StatusFlags.V); break;
+                case Instructions.BVC: bfc(StatusFlags.V); break;
 
                 // BVS
-                case Instructions.BVS: cycles += 2; bfs(StatusFlags.V); break;
+                case Instructions.BVS: bfs(StatusFlags.V); break;
 
                 // NOP
                 case Instructions.NOP:
@@ -1312,19 +1531,19 @@ namespace C64Emulator
                 case Instructions.NOP04:
                 case Instructions.NOP05:
                 case Instructions.NOP06:
-                    cycles += 2; break;
+                    idle(); break;
 
                 case Instructions.NOP_imm01:
                 case Instructions.NOP_imm02:
                 case Instructions.NOP_imm03:
                 case Instructions.NOP_imm04:
                 case Instructions.NOP_imm05:
-                    cycles += 2; break;
+                    read(immediate()); break;
 
                 case Instructions.NOP_zp01:
                 case Instructions.NOP_zp02:
                 case Instructions.NOP_zp03:
-                    cycles += 3; break;
+                    read(zeroPage()); break;
 
                 case Instructions.NOP_zpx01:
                 case Instructions.NOP_zpx02:
@@ -1332,9 +1551,9 @@ namespace C64Emulator
                 case Instructions.NOP_zpx04:
                 case Instructions.NOP_zpx05:
                 case Instructions.NOP_zpx06:
-                    cycles += 4; break;
+                    read(zeroPageX()); break;
 
-                case Instructions.NOP_abs: cycles += 4; break;
+                case Instructions.NOP_abs: read(absolute()); break;
 
                 case Instructions.NOP_abx01:
                 case Instructions.NOP_abx02:
@@ -1342,28 +1561,28 @@ namespace C64Emulator
                 case Instructions.NOP_abx04:
                 case Instructions.NOP_abx05:
                 case Instructions.NOP_abx06:
-                    cycles += 4; absoluteX(true); break;
+                    read(absoluteX(true)); break;
 
                 // PHA
-                case Instructions.PHA: cycles += 3; stackPush(registers.A); break;
+                case Instructions.PHA: idle(); stackPush(registers.A); break;
 
                 // PHP
-                case Instructions.PHP: cycles += 3; stackPush((byte)(registers.P | 0x30)); break;
+                case Instructions.PHP: idle(); stackPush((byte)(registers.P | 0x30)); break;
 
                 // PLA
-                case Instructions.PLA: cycles += 4; pla(); break;
+                case Instructions.PLA: idle(); idle(); pla(); break;
 
                 // PLP
-                case Instructions.PLP: cycles += 4; pullStatus(); break;
+                case Instructions.PLP: idle(); idle(); pullStatus(); break;
 
                 // SEC
-                case Instructions.SEC: cycles += 2; setFlag(StatusFlags.C, true); break;
+                case Instructions.SEC: idle(); setFlag(StatusFlags.C, true); break;
 
                 // SED
-                case Instructions.SED: cycles += 2; setFlag(StatusFlags.D, true); break;
+                case Instructions.SED: idle(); setFlag(StatusFlags.D, true); break;
 
                 // SEI
-                case Instructions.SEI: cycles += 2; setFlag(StatusFlags.I, true); break;
+                case Instructions.SEI: idle(); setFlag(StatusFlags.I, true); break;
 
                 // ILLEGAL OPCODES------------------------------------------------------
 
@@ -1387,114 +1606,112 @@ namespace C64Emulator
                 // ANC
                 case Instructions.ANC01:
                 case Instructions.ANC02:
-                    cycles += 2;
                     and(immediate());
                     setFlag(StatusFlags.C, (registers.A & 0x80) != 0);
                     break;
 
                 // ANE
-                case Instructions.ANE: cycles += 2; break;
+                case Instructions.ANE: idle(); break;
 
                 // ARR
-                case Instructions.ARR: cycles += 2; and(immediate()); ror(); break;
+                case Instructions.ARR: and(immediate()); ror(); break;
 
                 // ASR
-                case Instructions.ASR: cycles += 2; and(immediate()); lsr(); break;
+                case Instructions.ASR: and(immediate()); lsr(); break;
 
                 // DCP
-                case Instructions.DCP_zp: cycles += 5; address = zeroPage(); dec(address); cmp(address); break;
-                case Instructions.DCP_zpx: cycles += 6; address = zeroPageX(); dec(address); cmp(address); break;
-                case Instructions.DCP_abs: cycles += 6; address = absolute(); dec(address); cmp(address); break;
-                case Instructions.DCP_abx: cycles += 7; address = absoluteX(false); dec(address); cmp(address); break;
-                case Instructions.DCP_aby: cycles += 7; address = absoluteY(false); dec(address); cmp(address); break;
-                case Instructions.DCP_izx: cycles += 8; address = indirectX(); dec(address); cmp(address); break;
-                case Instructions.DCP_izy: cycles += 8; address = indirectY(false); dec(address); cmp(address); break;
+                case Instructions.DCP_zp: address = zeroPage(); cmpValue(dec(address)); break;
+                case Instructions.DCP_zpx: address = zeroPageX(); cmpValue(dec(address)); break;
+                case Instructions.DCP_abs: address = absolute(); cmpValue(dec(address)); break;
+                case Instructions.DCP_abx: address = absoluteXForWrite(); cmpValue(dec(address)); break;
+                case Instructions.DCP_aby: address = absoluteYForWrite(); cmpValue(dec(address)); break;
+                case Instructions.DCP_izx: address = indirectX(); cmpValue(dec(address)); break;
+                case Instructions.DCP_izy: address = indirectYForWrite(); cmpValue(dec(address)); break;
 
                 // ICB
-                case Instructions.ISB_zp: cycles += 5; address = zeroPage(); inc(address); sbc(address); break;
-                case Instructions.ISB_zpx: cycles += 6; address = zeroPageX(); inc(address); sbc(address); break;
-                case Instructions.ISB_abs: cycles += 6; address = absolute(); inc(address); sbc(address); break;
-                case Instructions.ISB_abx: cycles += 7; address = absoluteX(false); inc(address); sbc(address); break;
-                case Instructions.ISB_aby: cycles += 7; address = absoluteY(false); inc(address); sbc(address); break;
-                case Instructions.ISB_izx: cycles += 8; address = indirectX(); inc(address); sbc(address); break;
-                case Instructions.ISB_izy: cycles += 8; address = indirectY(false); inc(address); sbc(address); break;
+                case Instructions.ISB_zp: address = zeroPage(); sbcValue(inc(address)); break;
+                case Instructions.ISB_zpx: address = zeroPageX(); sbcValue(inc(address)); break;
+                case Instructions.ISB_abs: address = absolute(); sbcValue(inc(address)); break;
+                case Instructions.ISB_abx: address = absoluteXForWrite(); sbcValue(inc(address)); break;
+                case Instructions.ISB_aby: address = absoluteYForWrite(); sbcValue(inc(address)); break;
+                case Instructions.ISB_izx: address = indirectX(); sbcValue(inc(address)); break;
+                case Instructions.ISB_izy: address = indirectYForWrite(); sbcValue(inc(address)); break;
 
                 //LAE
                 case Instructions.LAE:
-                    cycles += 4;
-                    registers.S &= bus.Peek(absoluteY(true));
+                    registers.S &= read(absoluteY(true));
                     tsx();
                     txa();
                     break;
 
                 // LAX
-                case Instructions.LAX_zp: cycles += 3; lda(zeroPage()); tax(); break;
-                case Instructions.LAX_zpy: cycles += 4; lda(zeroPageY()); tax(); break;
-                case Instructions.LAX_abs: cycles += 4; lda(absolute()); tax(); break;
-                case Instructions.LAX_aby: cycles += 4; lda(absoluteY(true)); tax(); break;
-                case Instructions.LAX_izx: cycles += 6; lda(indirectX()); tax(); break;
-                case Instructions.LAX_izy: cycles += 5; lda(indirectY(true)); tax(); break;
+                case Instructions.LAX_zp: lda(zeroPage()); tax(); break;
+                case Instructions.LAX_zpy: lda(zeroPageY()); tax(); break;
+                case Instructions.LAX_abs: lda(absolute()); tax(); break;
+                case Instructions.LAX_aby: lda(absoluteY(true)); tax(); break;
+                case Instructions.LAX_izx: lda(indirectX()); tax(); break;
+                case Instructions.LAX_izy: lda(indirectY(true)); tax(); break;
 
                 // LXA
-                case Instructions.LXA: cycles += 2; break;
+                case Instructions.LXA: idle(); break;
 
                 // RLA
-                case Instructions.RLA_zp: cycles += 5; address = zeroPage(); rol(address); and(address); break;
-                case Instructions.RLA_zpx: cycles += 6; address = zeroPageX(); rol(address); and(address); break;
-                case Instructions.RLA_abs: cycles += 6; address = absolute(); rol(address); and(address); break;
-                case Instructions.RLA_abx: cycles += 7; address = absoluteX(false); rol(address); and(address); break;
-                case Instructions.RLA_aby: cycles += 7; address = absoluteY(false); rol(address); and(address); break;
-                case Instructions.RLA_izx: cycles += 8; address = indirectX(); rol(address); and(address); break;
-                case Instructions.RLA_izy: cycles += 8; address = indirectY(false); rol(address); and(address); break;
+                case Instructions.RLA_zp: address = zeroPage(); andValue(rol(address)); break;
+                case Instructions.RLA_zpx: address = zeroPageX(); andValue(rol(address)); break;
+                case Instructions.RLA_abs: address = absolute(); andValue(rol(address)); break;
+                case Instructions.RLA_abx: address = absoluteXForWrite(); andValue(rol(address)); break;
+                case Instructions.RLA_aby: address = absoluteYForWrite(); andValue(rol(address)); break;
+                case Instructions.RLA_izx: address = indirectX(); andValue(rol(address)); break;
+                case Instructions.RLA_izy: address = indirectYForWrite(); andValue(rol(address)); break;
 
                 // RRA
-                case Instructions.RRA_zp: cycles += 5; address = zeroPage(); ror(address); adc(address); break;
-                case Instructions.RRA_zpx: cycles += 6; address = zeroPageX(); ror(address); adc(address); break;
-                case Instructions.RRA_abs: cycles += 6; address = absolute(); ror(address); adc(address); break;
-                case Instructions.RRA_abx: cycles += 7; address = absoluteX(false); ror(address); adc(address); break;
-                case Instructions.RRA_aby: cycles += 7; address = absoluteY(false); ror(address); adc(address); break;
-                case Instructions.RRA_izx: cycles += 8; address = indirectX(); ror(address); adc(address); break;
-                case Instructions.RRA_izy: cycles += 8; address = indirectY(false); ror(address); adc(address); break;
+                case Instructions.RRA_zp: address = zeroPage(); adcValue(ror(address)); break;
+                case Instructions.RRA_zpx: address = zeroPageX(); adcValue(ror(address)); break;
+                case Instructions.RRA_abs: address = absolute(); adcValue(ror(address)); break;
+                case Instructions.RRA_abx: address = absoluteXForWrite(); adcValue(ror(address)); break;
+                case Instructions.RRA_aby: address = absoluteYForWrite(); adcValue(ror(address)); break;
+                case Instructions.RRA_izx: address = indirectX(); adcValue(ror(address)); break;
+                case Instructions.RRA_izy: address = indirectYForWrite(); adcValue(ror(address)); break;
 
                 // SAX
-                case Instructions.SAX_zp: cycles += 3; bus.Poke(zeroPage(), (byte)(registers.A & registers.X)); break;
-                case Instructions.SAX_zpy: cycles += 4; bus.Poke(zeroPageY(), (byte)(registers.A & registers.X)); break;
-                case Instructions.SAX_abs: cycles += 4; bus.Poke(absolute(), (byte)(registers.A & registers.X)); break;
-                case Instructions.SAX_izx: cycles += 6; bus.Poke(indirectX(), (byte)(registers.A & registers.X)); break;
+                case Instructions.SAX_zp: write(zeroPage(), (byte)(registers.A & registers.X)); break;
+                case Instructions.SAX_zpy: write(zeroPageY(), (byte)(registers.A & registers.X)); break;
+                case Instructions.SAX_abs: write(absolute(), (byte)(registers.A & registers.X)); break;
+                case Instructions.SAX_izx: write(indirectX(), (byte)(registers.A & registers.X)); break;
 
                 // SBX
-                case Instructions.SBX: cycles += 2; break;
+                case Instructions.SBX: idle(); break;
 
                 // SHA
-                case Instructions.SHA_abx: cycles += 5; break;
-                case Instructions.SHA_aby: cycles += 5; break;
+                case Instructions.SHA_abx: idle(5); break;
+                case Instructions.SHA_aby: idle(5); break;
 
                 // SHS
-                case Instructions.SHS: cycles += 5; break;
+                case Instructions.SHS: idle(5); break;
 
                 // SHX
-                case Instructions.SHX: cycles += 5; break;
+                case Instructions.SHX: idle(5); break;
 
                 // SHY
-                case Instructions.SHY: cycles += 5; break;
+                case Instructions.SHY: idle(5); break;
 
                 // SLO
-                case Instructions.SLO_zp: cycles += 5; address = zeroPage(); asl(address); ora(address); break;
-                case Instructions.SLO_zpx: cycles += 6; address = zeroPageX(); asl(address); ora(address); break;
-                case Instructions.SLO_abs: cycles += 6; address = absolute(); asl(address); ora(address); break;
-                case Instructions.SLO_abx: cycles += 7; address = absoluteX(false); asl(address); ora(address); break;
-                case Instructions.SLO_aby: cycles += 7; address = absoluteY(false); asl(address); ora(address); break;
-                case Instructions.SLO_izx: cycles += 8; address = indirectX(); asl(address); ora(address); break;
-                case Instructions.SLO_izy: cycles += 8; address = indirectY(false); asl(address); ora(address); break;
+                case Instructions.SLO_zp: address = zeroPage(); oraValue(asl(address)); break;
+                case Instructions.SLO_zpx: address = zeroPageX(); oraValue(asl(address)); break;
+                case Instructions.SLO_abs: address = absolute(); oraValue(asl(address)); break;
+                case Instructions.SLO_abx: address = absoluteXForWrite(); oraValue(asl(address)); break;
+                case Instructions.SLO_aby: address = absoluteYForWrite(); oraValue(asl(address)); break;
+                case Instructions.SLO_izx: address = indirectX(); oraValue(asl(address)); break;
+                case Instructions.SLO_izy: address = indirectYForWrite(); oraValue(asl(address)); break;
 
                 // SRE
-                case Instructions.SRE_zp: cycles += 5; address = zeroPage(); lsr(address); eor(address); break;
-                case Instructions.SRE_zpx: cycles += 6; address = zeroPageX(); lsr(address); eor(address); break;
-                case Instructions.SRE_abs: cycles += 6; address = absolute(); lsr(address); eor(address); break;
-                case Instructions.SRE_abx: cycles += 7; address = absoluteX(false); lsr(address); eor(address); break;
-                case Instructions.SRE_aby: cycles += 7; address = absoluteY(false); lsr(address); eor(address); break;
-                case Instructions.SRE_izx: cycles += 8; address = indirectX(); lsr(address); eor(address); break;
-                case Instructions.SRE_izy: cycles += 8; address = indirectY(false); lsr(address); eor(address); break;
+                case Instructions.SRE_zp: address = zeroPage(); eorValue(lsr(address)); break;
+                case Instructions.SRE_zpx: address = zeroPageX(); eorValue(lsr(address)); break;
+                case Instructions.SRE_abs: address = absolute(); eorValue(lsr(address)); break;
+                case Instructions.SRE_abx: address = absoluteXForWrite(); eorValue(lsr(address)); break;
+                case Instructions.SRE_aby: address = absoluteYForWrite(); eorValue(lsr(address)); break;
+                case Instructions.SRE_izx: address = indirectX(); eorValue(lsr(address)); break;
+                case Instructions.SRE_izy: address = indirectYForWrite(); eorValue(lsr(address)); break;
             }
 
             return cycles;

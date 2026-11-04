@@ -116,6 +116,11 @@ namespace C64Emulator
             return (ushort)(Peek(address) | (Peek((ushort)(address + 1)) << 8));
         }
 
+        public void Idle()
+        {
+            // Plain memory has no devices to advance.
+        }
+
         /// <summary>
         /// The VIC sees RAM and the character ROM overlay at $1000-$1FFF and
         /// $9000-$9FFF. It does not see the KERNAL/BASIC ROMs or I/O.
