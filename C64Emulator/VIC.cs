@@ -1286,12 +1286,14 @@ namespace C64Emulator
 
         private void UpdateSpriteWidth(int sprite)
         {
-            // Multicolour and double-width sprites both double each source
-            // pixel. They can be enabled together, giving 96 output pixels
-            // from the same 24 bytes of sprite data.
-            int scale =
-                (sprites[sprite].MulticolorMode ? 2 : 1) *
-                (sprites[sprite].DoubleWidth ? 2 : 1);
+            // Only X expansion ($D01D) changes a sprite's on-screen width: a
+            // sprite is 24 pixels wide, or 48 when that bit is set.
+            // Multicolour mode does not widen it -- it pairs source bits into
+            // 12 colour pixels that are already two pixels wide on their own,
+            // which GetSpritePixel handles. Treating multicolour as a width
+            // multiplier drew every multicolour sprite (DOTC's castles and
+            // raiders among them) twice as wide as it should be.
+            int scale = sprites[sprite].DoubleWidth ? 2 : 1;
 
             sprites[sprite].PixelScale = scale;
             sprites[sprite].Width = 24 * scale;

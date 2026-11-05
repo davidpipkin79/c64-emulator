@@ -532,7 +532,7 @@ namespace C64Emulator.Tests
         }
 
         [Fact]
-        public void MulticolorSpriteUsesFortyEightOutputPixels()
+        public void MulticolorSpriteUsesTwentyFourOutputPixels()
         {
             VIC vic = system.Vic!;
 
@@ -563,6 +563,74 @@ namespace C64Emulator.Tests
                     colored++;
             }
 
+            // Multicolour halves the horizontal resolution instead of
+            // widening the sprite: 12 bit pairs, each two pixels wide, still
+            // fill only the 24 pixels a sprite occupies. Treating it as a
+            // width multiplier made DOTC's castles and raiders twice as wide.
+            Assert.Equal(24, colored);
+        }
+
+        [Fact]
+        public void DoubleWidthSpriteUsesFortyEightOutputPixels()
+        {
+            VIC vic = system.Vic!;
+
+            vic.SetRegister(0x18, 0x00);
+            system.Memory.Poke(0xC3F8, 0x01);
+
+            for (int i = 0; i < 63; i++)
+                system.Memory.Poke((ushort)(0xC040 + i), 0xFF);
+
+            vic.SetRegister(0x15, 0x01); // enable sprite 0
+            vic.SetRegister(0x1D, 0x01); // sprite 0 is double width
+            vic.SetRegister(0x27, 0x02); // sprite color
+            vic.SetRegister(0x21, 0x00); // black background
+            vic.SetRegister(0x00, 100);  // sprite X
+            vic.SetRegister(0x01, 100);  // sprite Y
+
+            vic.Tick(VIC.CyclesPerFrame);
+            byte[] screen = vic.CapturePackedScreen();
+            int colored = 0;
+
+            for (int x = 120; x < 168; x++)
+            {
+                if (PaletteIndexAt(screen, x, 101) == 2)
+                    colored++;
+            }
+
+            Assert.Equal(48, colored);
+        }
+
+        [Fact]
+        public void MulticolorDoubleWidthSpriteStaysFortyEightPixels()
+        {
+            VIC vic = system.Vic!;
+
+            vic.SetRegister(0x18, 0x00);
+            system.Memory.Poke(0xC3F8, 0x01);
+
+            for (int i = 0; i < 63; i++)
+                system.Memory.Poke((ushort)(0xC040 + i), 0x55);
+
+            vic.SetRegister(0x15, 0x01); // enable sprite 0
+            vic.SetRegister(0x1C, 0x01); // multicolour
+            vic.SetRegister(0x1D, 0x01); // and double width
+            vic.SetRegister(0x25, 0x05); // multicolour color 1
+            vic.SetRegister(0x21, 0x00);
+            vic.SetRegister(0x00, 100);
+            vic.SetRegister(0x01, 100);
+
+            vic.Tick(VIC.CyclesPerFrame);
+            byte[] screen = vic.CapturePackedScreen();
+            int colored = 0;
+
+            for (int x = 120; x < 168; x++)
+            {
+                if (PaletteIndexAt(screen, x, 101) == 5)
+                    colored++;
+            }
+
+            // 12 bit pairs, each four pixels wide once expansion is applied.
             Assert.Equal(48, colored);
         }
 
