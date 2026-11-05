@@ -54,6 +54,7 @@ internal sealed class Renderer : IDisposable
     private int menuSelected;
     private int menuPosition;
     private bool menuVisible;
+    private string menuHint = string.Empty;
 
     private string[]? errorLines;
     private bool errorVisible;
@@ -519,6 +520,7 @@ internal sealed class Renderer : IDisposable
         SDL.RenderTexture(renderer, frameTexture, IntPtr.Zero, IntPtr.Zero);
 
         drawOverlay();
+        drawMenuHint();
 
         SDL.RenderPresent(renderer);
     }
@@ -549,7 +551,11 @@ internal sealed class Renderer : IDisposable
         return true;
     }
 
-    public void DrawMenu(List<MenuList> menu, int selectedItem, int currentPosition)
+    public void DrawMenu(
+        List<MenuList> menu,
+        int selectedItem,
+        int currentPosition,
+        string? hint = null)
     {
         if (disposed)
             return;
@@ -564,6 +570,7 @@ internal sealed class Renderer : IDisposable
             menuEntries = entries;
             menuSelected = selectedItem;
             menuPosition = currentPosition;
+            menuHint = hint ?? string.Empty;
             menuVisible = true;
             errorVisible = false;
         }
@@ -656,6 +663,35 @@ internal sealed class Renderer : IDisposable
 
         drawText(fpsFont, text, new SDL.Color { R = 0, G = 0, B = 0, A = 255 }, x, y);
         drawText(fpsFont, text, new SDL.Color { R = 255, G = 255, B = 255, A = 255 }, x + 1, y + 1);
+    }
+
+    private void drawMenuHint()
+    {
+        string hint;
+        bool visible;
+
+        lock (overlayLock)
+        {
+            hint = menuHint;
+            visible = menuVisible && !errorVisible;
+        }
+
+        if (!visible || string.IsNullOrEmpty(hint))
+            return;
+
+        // A footer band across the bottom border keeps the shortcuts
+        // readable without crowding the menu rows above it.
+        var bandY = C64HEIGHT - menuHeight - 6;
+
+        fillRect(0, bandY, C64WIDTH, C64HEIGHT - bandY, paletteColor(6));
+
+        drawText(
+            menuFont,
+            hint,
+            paletteColor(14),
+            C64BORDER + 10,
+            bandY + 3
+            );
     }
 
     private void drawMenuPanel(MenuEntry[] menu, int selected, int position)

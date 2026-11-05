@@ -56,6 +56,7 @@ internal abstract class Cia6526
     private byte controlB;
     private byte interruptFlags;
     private byte interruptMask;
+    private bool flagLineHigh = true;
 
     protected Cia6526(
         InterruptLine interrupts,
@@ -103,6 +104,7 @@ internal abstract class Cia6526
         controlB = 0;
         interruptFlags = 0;
         interruptMask = 0;
+        flagLineHigh = true;
         todCycles = 0;
         todHalted = false;
         todLatched = false;
@@ -129,6 +131,21 @@ internal abstract class Cia6526
 
         var timerAUnderflows = ProcessTimerA(cycles);
         ProcessTimerB(cycles, timerAUnderflows);
+    }
+
+    /// <summary>
+    /// Drives the CIA's active-low FLAG input. Only a high-to-low transition
+    /// sets the FLAG interrupt bit; this is the datasette READ line.
+    /// </summary>
+    public void SetFlag(bool high)
+    {
+        if (flagLineHigh == high)
+            return;
+
+        flagLineHigh = high;
+
+        if (!high)
+            SetInterruptFlag(0x10);
     }
 
     protected byte ReadRegister(ushort address)

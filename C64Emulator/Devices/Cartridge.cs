@@ -34,6 +34,12 @@ internal sealed class Cartridge
 
     public string Name { get; }
 
+    /// <summary>
+    /// The CRT file this cartridge was loaded from. Null for images built
+    /// directly from bytes. Save states use it to restore the cartridge.
+    /// </summary>
+    public string? SourcePath { get; private set; }
+
     public int HardwareType { get; }
 
     public bool ExRom { get; }
@@ -46,7 +52,9 @@ internal sealed class Cartridge
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
 
-        return FromBytes(File.ReadAllBytes(path));
+        Cartridge cartridge = FromBytes(File.ReadAllBytes(path));
+        cartridge.SourcePath = path;
+        return cartridge;
     }
 
     public static Cartridge FromBytes(byte[] bytes)

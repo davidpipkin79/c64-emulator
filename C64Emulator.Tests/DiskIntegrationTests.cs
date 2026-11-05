@@ -79,7 +79,7 @@ public sealed class DiskIntegrationTests
         Press(machine, Key.Return, ModifierKeys.None);
 
         // The DOS completes the OPEN/TALK handshake and starts sending
-        // the file. The default virtual path handles the complete load.
+        // the file. The complete multi-sector path is covered separately.
         var started = WaitUntil(
             machine,
             25_000_000,
@@ -90,6 +90,125 @@ public sealed class DiskIntegrationTests
         Assert.True(
             started,
             Failure(machine, "The real drive did not start the load"));
+    }
+
+    [Fact]
+    public void RealDriveLoadsAFileSpanningMultipleD64Sectors()
+    {
+        var romDirectory = GetRomDirectory();
+        var driveRom = Path.Combine(romDirectory, "dos1541.rom");
+
+        if (
+            !File.Exists(Path.Combine(romDirectory, "kernal.rom")) ||
+            !File.Exists(Path.Combine(romDirectory, "basic.rom")) ||
+            !File.Exists(Path.Combine(romDirectory, "char.rom")) ||
+            !File.Exists(driveRom))
+        {
+            return;
+        }
+
+        using C64Machine machine = new C64Machine(
+            RomSet.Load(romDirectory),
+            File.ReadAllBytes(driveRom));
+
+        machine.TrueDriveEmulation = true;
+
+        D64Image disk = D64Image.FromBytes(CreateTestDisk());
+
+        // A stock 1541 transfers roughly 400 bytes per second, so this
+        // 150-sector file crosses several tracks and takes almost 100
+        // million C64 cycles even though it is progressing correctly.
+        var program = new byte[38_000 + 2];
+        program[0] = 0x01;
+        program[1] = 0x08;
+
+        for (var i = 2; i < program.Length; i++)
+            program[i] = (byte)(0x41 + (i % 26));
+
+        disk.SaveFile("BIG", program);
+        machine.Drive.Mount(disk);
+        machine.Drive.Reset();
+        machine.Cpu.Reset();
+
+        WaitForReady(machine);
+
+        Type(machine, "LOAD\"BIG\",8,1");
+        Press(machine, Key.Return, ModifierKeys.None);
+
+        var loaded = WaitUntil(
+            machine,
+            160_000_000,
+            () =>
+            {
+                for (var i = 0; i < program.Length - 2; i++)
+                {
+                    if (
+                        machine.Memory.Peek((ushort)(0x0801 + i)) !=
+                        program[i + 2])
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            });
+
+        if (!loaded)
+        {
+            var matched = 0;
+
+            while (
+                matched < program.Length - 2 &&
+                machine.Memory.Peek((ushort)(0x0801 + matched)) ==
+                    program[matched + 2])
+            {
+                matched++;
+            }
+
+            Assert.Fail(
+                Failure(
+                    machine,
+                    "The real drive did not finish the multi-sector load: " +
+                    "matched=" + matched + "/" + (program.Length - 2) +
+                    " expected=" + program[matched + 2].ToString("X2") +
+                    " actual=" +
+                    machine.Memory.Peek((ushort)(0x0801 + matched)).ToString("X2")));
+        }
+    }
+
+    [Fact]
+    public void TypedAutostartLoadsTheFirstFileOnTheMountedDisk()
+    {
+        var romDirectory = GetRomDirectory();
+
+        if (
+            !File.Exists(Path.Combine(romDirectory, "kernal.rom")) ||
+            !File.Exists(Path.Combine(romDirectory, "basic.rom")) ||
+            !File.Exists(Path.Combine(romDirectory, "char.rom")))
+        {
+            return;
+        }
+
+        using C64Machine machine = new C64Machine(RomSet.Load(romDirectory));
+
+        machine.Drive.Mount(D64Image.FromBytes(CreateTestDisk()));
+        machine.Drive.Reset();
+        machine.Cpu.Reset();
+
+        WaitForReady(machine);
+
+        // The file browser's Space shortcut queues this instead of loading
+        // the file directly.
+        machine.TypeText("LOAD\"*\",8,1\rRUN\r");
+
+        var loaded = WaitUntil(
+            machine,
+            25_000_000,
+            () =>
+                machine.Memory.Peek(0xC000) == 0x41 &&
+                machine.Memory.Peek(0xC001) == 0x42);
+
+        Assert.True(loaded, Failure(machine, "The typed autostart did not load"));
     }
 
     private static void WaitForReady(C64Machine machine)

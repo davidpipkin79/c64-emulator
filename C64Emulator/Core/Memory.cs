@@ -21,6 +21,23 @@ internal sealed class Memory : IMemoryBus, IVideoBus
     private bool loram;
     private bool hiram;
     private bool charen;
+    private byte processorPortInput = 0x10;
+
+    /// <summary>
+    /// Input pins on the 6510 processor port. Bit 4 is the active-low
+    /// cassette SENSE input; the other bits have no connected inputs.
+    /// </summary>
+    public byte ProcessorPortInput
+    {
+        get => processorPortInput;
+        set => processorPortInput = value;
+    }
+
+    /// <summary>
+    /// Called after the processor port output latch changes, so cassette
+    /// hardware can follow the MOTOR line.
+    /// </summary>
+    internal Action<byte>? ProcessorPortWritten { get; set; }
 
     public Memory()
     {
@@ -90,10 +107,21 @@ internal sealed class Memory : IMemoryBus, IVideoBus
 
         if (address <= AddressMap.ProcessorPort)
             UpdateMemoryConfiguration();
+
+        if (address == AddressMap.ProcessorPort)
+            ProcessorPortWritten?.Invoke(value);
     }
 
     public byte Peek(ushort address)
     {
+        if (address == AddressMap.ProcessorPort)
+        {
+            var direction = ram[AddressMap.ProcessorPortDirection];
+            return (byte)(
+                (ram[AddressMap.ProcessorPort] & direction) |
+                (processorPortInput & ~direction));
+        }
+
         // Standard cartridges drive ROML (and ROMH for 16K images) onto
         // the bus regardless of the processor port. Writes still land in
         // the underlying RAM so a cartridge can be removed cleanly.
@@ -159,6 +187,11 @@ internal sealed class Memory : IMemoryBus, IVideoBus
         }
 
         return ram[address];
+    }
+
+    internal void RefreshConfiguration()
+    {
+        UpdateMemoryConfiguration();
     }
 
     private void UpdateMemoryConfiguration()

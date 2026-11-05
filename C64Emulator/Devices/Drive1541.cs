@@ -74,6 +74,8 @@ internal sealed class Drive1541
         Reset();
     }
 
+    internal InterruptLine Interrupts => interrupts;
+
     public Cpu6510 Cpu => cpu;
 
     public Via6522 Via1 => via1;

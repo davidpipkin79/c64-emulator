@@ -40,8 +40,11 @@ internal sealed class D64Image
     private const int StandardTracks = 35;
     private const int ExtendedTracks = 40;
 
+    private const int MaxWritableTrack = 35;
+
     private readonly byte[] data;
     private readonly int[] trackOffsets;
+    private D64FileInfo[] directory;
 
     private D64Image(byte[] data, int trackCount)
     {
@@ -62,8 +65,7 @@ internal sealed class D64Image
 
         SectorCount = offset / SectorSize;
 
-        D64FileInfo[] directory = ReadDirectory();
-        Directory = directory;
+        directory = ReadDirectory();
 
         ReadOnlySpan<byte> bam = GetSector(18, 0);
         DiskName = ReadPetscii(bam.Slice(0x90, 16)).Trim();
@@ -86,7 +88,7 @@ internal sealed class D64Image
     /// </summary>
     public byte[] DiskIdBytes { get; }
 
-    public IReadOnlyList<D64FileInfo> Directory { get; }
+    public IReadOnlyList<D64FileInfo> Directory => directory;
 
     public static D64Image Load(string path)
     {
@@ -187,6 +189,82 @@ internal sealed class D64Image
 
         File.WriteAllBytes(path, data);
         IsDirty = false;
+    }
+
+    /// <summary>
+    /// Writes a new closed PRG file into the image. The program must start
+    /// with the usual little-endian load address; that address is stored in
+    /// the first two bytes of the D64 file chain just like a real SAVE.
+    /// Existing files are not overwritten.
+    /// </summary>
+    public void SaveFile(string name, ReadOnlySpan<byte> program)
+    {
+        if (program.Length < 2)
+            throw new InvalidDataException("Program file is too short.");
+
+        var trimmedName = (name ?? string.Empty).Trim();
+
+        if (trimmedName.Length == 0)
+            throw new InvalidDataException("A disk filename is required.");
+
+        if (FindFile(trimmedName) is not null)
+        {
+            throw new InvalidOperationException(
+                "A file with that name already exists on the disk.");
+        }
+
+        var sectorCount = (program.Length + 253) / 254;
+        List<(int Track, int Sector)> sectors = AllocateSectors(sectorCount);
+
+        if (sectors.Count != sectorCount)
+        {
+            FreeSectors(sectors);
+            throw new IOException("The disk is full.");
+        }
+
+        try
+        {
+            var offset = 0;
+
+            for (var i = 0; i < sectors.Count; i++)
+            {
+                var (track, sector) = sectors[i];
+                var block = GetWritableSector(track, sector);
+                block.Clear();
+
+                var chunk = Math.Min(254, program.Length - offset);
+
+                if (i + 1 < sectors.Count)
+                {
+                    block[0] = (byte)sectors[i + 1].Track;
+                    block[1] = (byte)sectors[i + 1].Sector;
+                }
+                else
+                {
+                    // A zero link byte count means the final sector is full.
+                    block[0] = 0;
+                    block[1] = chunk < 254 ? (byte)(chunk + 1) : (byte)0;
+                }
+
+                program.Slice(offset, chunk).CopyTo(block.Slice(2));
+                offset += chunk;
+            }
+
+            var entryOffset = FindFreeDirectoryEntry();
+            WriteDirectoryEntry(
+                entryOffset,
+                trimmedName,
+                sectors[0].Track,
+                sectors[0].Sector,
+                sectors.Count);
+            directory = ReadDirectory();
+            IsDirty = true;
+        }
+        catch
+        {
+            FreeSectors(sectors);
+            throw;
+        }
     }
 
     public byte[] ToArray()
@@ -302,6 +380,139 @@ internal sealed class D64Image
             count += SectorsPerTrack(track);
 
         return count;
+    }
+
+    private Span<byte> GetWritableSector(int track, int sector)
+    {
+        var offset = trackOffsets[track] + (sector * SectorSize);
+        return data.AsSpan(offset, SectorSize);
+    }
+
+    private Span<byte> Bam => data.AsSpan(trackOffsets[18], SectorSize);
+
+    private List<(int Track, int Sector)> AllocateSectors(int count)
+    {
+        List<(int Track, int Sector)> allocated = [];
+
+        if (count <= 0)
+            return allocated;
+
+        Span<byte> bam = Bam;
+        var limit = Math.Min(MaxWritableTrack, TrackCount);
+
+        for (var track = 1; track <= limit && allocated.Count < count; track++)
+        {
+            // Track 18 is the directory track. Keeping it out of the file
+            // allocator avoids mixing directory sectors into data chains.
+            if (track == 18)
+                continue;
+
+            var entry = 4 + ((track - 1) * 4);
+
+            if (bam[entry] == 0)
+                continue;
+
+            var sectorCount = SectorsPerTrack(track);
+
+            for (
+                var sector = 0;
+                sector < sectorCount && allocated.Count < count;
+                sector++)
+            {
+                var bitmapByte = entry + 1 + (sector >> 3);
+                var mask = (byte)(1 << (sector & 7));
+
+                if ((bam[bitmapByte] & mask) == 0)
+                    continue;
+
+                bam[bitmapByte] &= (byte)~mask;
+                bam[entry]--;
+                allocated.Add((track, sector));
+            }
+        }
+
+        return allocated;
+    }
+
+    private void FreeSectors(List<(int Track, int Sector)> sectors)
+    {
+        Span<byte> bam = Bam;
+
+        foreach (var (track, sector) in sectors)
+        {
+            if (track is < 1 or > MaxWritableTrack)
+                continue;
+
+            var entry = 4 + ((track - 1) * 4);
+            var bitmapByte = entry + 1 + (sector >> 3);
+            var mask = (byte)(1 << (sector & 7));
+
+            if ((bam[bitmapByte] & mask) != 0)
+                continue;
+
+            bam[bitmapByte] |= mask;
+            bam[entry]++;
+        }
+    }
+
+    private int FindFreeDirectoryEntry()
+    {
+        var track = 18;
+        var sector = 1;
+        HashSet<int> visited = [];
+
+        while (track != 0 && IsValidSector(track, sector))
+        {
+            var key = (track * 256) + sector;
+
+            if (!visited.Add(key))
+                break;
+
+            var offset = trackOffsets[track] + (sector * SectorSize);
+
+            for (var entry = 0; entry < 8; entry++)
+            {
+                var entryOffset = offset + (entry * 32);
+
+                if ((data[entryOffset + 2] & 0x0F) == 0)
+                    return entryOffset;
+            }
+
+            track = data[offset];
+            sector = data[offset + 1];
+        }
+
+        throw new IOException("The disk directory is full.");
+    }
+
+    private void WriteDirectoryEntry(
+        int entryOffset,
+        string name,
+        int startTrack,
+        int startSector,
+        int blocks)
+    {
+        data[entryOffset + 2] = 0x82; // closed PRG
+        data[entryOffset + 3] = (byte)startTrack;
+        data[entryOffset + 4] = (byte)startSector;
+
+        for (var i = 0; i < 16; i++)
+        {
+            data[entryOffset + 5 + i] = i < name.Length
+                ? EncodePetscii(name[i])
+                : (byte)0xA0;
+        }
+
+        data[entryOffset + 30] = (byte)(blocks & 0xFF);
+        data[entryOffset + 31] = (byte)((blocks >> 8) & 0xFF);
+    }
+
+    private static byte EncodePetscii(char value)
+    {
+        if (value is >= 'a' and <= 'z')
+            value = (char)(value - 32);
+
+        return value is >= ' ' and <= '~' ? (byte)value : (byte)'?';
     }
 
     private D64FileInfo[] ReadDirectory()

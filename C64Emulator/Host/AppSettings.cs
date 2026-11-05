@@ -68,6 +68,12 @@ internal sealed class AppSettings
 
     public string LastHost { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Directory the media browser was last showing, so loading a program
+    /// resumes in the folder that was left last.
+    /// </summary>
+    public string LastMediaDirectory { get; set; } = string.Empty;
+
     public bool ShowSpeed { get; set; }
 
     /// <summary>
@@ -126,6 +132,7 @@ internal sealed class AppSettings
     private void Normalize()
     {
         LastHost = LastHost ?? string.Empty;
+        LastMediaDirectory = LastMediaDirectory ?? string.Empty;
         ResolutionWidth = Math.Max(403, ResolutionWidth);
         ResolutionHeight = Math.Max(284, ResolutionHeight);
         DisplayRefreshRate = Math.Max(0, DisplayRefreshRate);

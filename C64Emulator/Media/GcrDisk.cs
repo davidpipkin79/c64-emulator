@@ -120,6 +120,12 @@ internal sealed class GcrDisk
     public byte PortBInput =>
         (byte)((writeProtected ? 0x00 : 0x10) | (Sync ? 0x00 : 0x80));
 
+    internal void RebuildTracks()
+    {
+        if (image is not null)
+            BuildTracks();
+    }
+
     public void Mount(D64Image image, string? path)
     {
         this.image = image ?? throw new ArgumentNullException(nameof(image));

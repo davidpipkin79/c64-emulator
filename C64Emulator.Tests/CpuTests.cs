@@ -217,6 +217,10 @@ public sealed class CpuTests : IDisposable
     [Fact]
     public void IndirectX_WrapsPointerInZeroPage()
     {
+        // $0000/$0001 are the 6510 processor port's direction and data
+        // registers, not ordinary RAM. $0000=0 makes every pin an input, so
+        // drive the pointer's high byte on the input pins instead.
+        system.Memory.ProcessorPortInput = 0x20;
         write(0x0000, 0x00);
         write(0x0001, 0x20);
         write(0x2000, 0x7E);

@@ -66,6 +66,104 @@ public sealed class D64Tests
     }
 
     [Fact]
+    public void SaveFileWritesDirectoryAndPersists()
+    {
+        var path = Path.Combine(
+            Path.GetTempPath(),
+            "c64-save-" + Guid.NewGuid().ToString("N") + ".d64");
+        var imageBytes = CreateWritableDisk();
+
+        try
+        {
+            File.WriteAllBytes(path, imageBytes);
+            D64Image disk = D64Image.Load(path);
+            byte[] program = [0x01, 0x08, 0x41, 0x42, 0x43];
+
+            disk.SaveFile("NEW", program);
+
+            Assert.True(disk.IsDirty);
+            D64FileInfo saved = Assert.Single(disk.Directory);
+            Assert.Equal("NEW", saved.Name);
+            Assert.Equal(program, disk.ReadFile(saved));
+
+            disk.Save(path);
+            D64Image reloaded = D64Image.Load(path);
+            D64FileInfo? reloadedFile = reloaded.FindFile("NEW");
+
+            Assert.NotNull(reloadedFile);
+            Assert.Equal(program, reloaded.ReadFile(reloadedFile));
+            Assert.False(reloaded.IsDirty);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void SaveFileWritesAndReadsAMultiSectorChain()
+    {
+        D64Image disk = D64Image.FromBytes(CreateWritableDisk());
+        byte[] program = new byte[602];
+        program[0] = 0x01;
+        program[1] = 0x08;
+
+        for (var i = 2; i < program.Length; i++)
+            program[i] = (byte)(i & 0xFF);
+
+        disk.SaveFile("BIG", program);
+        D64FileInfo saved = Assert.Single(disk.Directory);
+
+        Assert.Equal(3, saved.Blocks);
+        Assert.Equal(program, disk.ReadFile(saved));
+    }
+
+    [Fact]
+    public void KernalSaveTrapWritesProgramToMountedDisk()
+    {
+        var romDirectory = Path.GetFullPath(
+            Path.Combine(
+                AppContext.BaseDirectory,
+                "..", "..", "..", "..",
+                "C64Emulator", "Roms"));
+
+        if (!File.Exists(Path.Combine(romDirectory, "kernal.rom")))
+            return;
+
+        using C64Machine machine = new C64Machine(RomSet.Load(romDirectory));
+        machine.Drive.Mount(D64Image.FromBytes(CreateWritableDisk()));
+        WriteFilename(machine, "NEW");
+        machine.Memory.Poke(0xBA, 8);
+
+        machine.Memory.Poke(0xFB, 0x01);
+        machine.Memory.Poke(0xFC, 0x08);
+        machine.Memory.Poke(0x0801, 0x41);
+        machine.Memory.Poke(0x0802, 0x42);
+        machine.Memory.Poke(0x0803, 0x43);
+        machine.Memory.Poke(0x0804, 0x44);
+        machine.Memory.Poke(0x0805, 0x45);
+
+        machine.Cpu.A = 0xFB;
+        machine.Cpu.X = 0x06;
+        machine.Cpu.Y = 0x08;
+        machine.Cpu.S = 0xFD;
+        machine.Memory.Poke(0x01FE, 0x34);
+        machine.Memory.Poke(0x01FF, 0x12);
+        machine.Cpu.SetPC(0xFFD8);
+
+        machine.RunCycles(1);
+
+        Assert.Equal(0x1235, machine.Cpu.GetPC());
+        Assert.Equal(0, machine.Cpu.P & 0x01);
+        D64FileInfo? saved = machine.Drive.FindFile("NEW");
+
+        Assert.NotNull(saved);
+        Assert.Equal(
+            new byte[] { 0x01, 0x08, 0x41, 0x42, 0x43, 0x44, 0x45 },
+            machine.Drive.ReadFile(saved));
+    }
+
+    [Fact]
     public void MenuLoadStartsAProgramFromTheMountedDisk()
     {
         var romDirectory = Path.GetFullPath(
@@ -223,6 +321,28 @@ public sealed class D64Tests
 
         for (var i = 0; i < name.Length; i++)
             machine.Memory.Poke((ushort)(address + i), (byte)name[i]);
+    }
+
+    private static byte[] CreateWritableDisk()
+    {
+        var image = CreateImage();
+        var bam = Offset(18, 0);
+
+        for (var track = 1; track <= 35; track++)
+        {
+            var entry = bam + 4 + ((track - 1) * 4);
+            var sectors = D64Image.SectorsPerTrack(track);
+
+            image[entry] = (byte)sectors;
+
+            for (var sector = 0; sector < sectors; sector++)
+            {
+                image[entry + 1 + (sector >> 3)] |=
+                    (byte)(1 << (sector & 7));
+            }
+        }
+
+        return image;
     }
 
     private static byte[] CreateImage(params (string Name, byte[] Data)[] files)

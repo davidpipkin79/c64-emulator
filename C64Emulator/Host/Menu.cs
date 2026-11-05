@@ -42,6 +42,11 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
     private string networkAddress = AppSettings.Current.LastHost;
     private bool settingKeyset;
     private string keysetText = string.Empty;
+
+    // Where Left/Backspace go from the current menu, and the folder the
+    // media browser is currently showing.
+    private string backTarget = "return";
+    private string mediaDirectory = string.Empty;
     private AudioDeviceInfo[] audioDevices = [];
     private int audioDeviceIndex;
 
@@ -64,7 +69,7 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                 keysetText = string.Empty;
                 settingKeyset = false;
                 LoadMainMenu();
-                renderer.DrawMenu(menuList, selectedItem, currentPosition);
+                renderer.DrawMenu(menuList, selectedItem, currentPosition, HintText);
             }
         }
     }
@@ -84,7 +89,7 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
         }
 
         if (active)
-            renderer.DrawMenu(menuList, selectedItem, currentPosition);
+            renderer.DrawMenu(menuList, selectedItem, currentPosition, HintText);
     }
 
     private void CaptureKeySet(KeyboardEventArgs key)
@@ -156,6 +161,10 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                     currentPosition = Math.Max(0, currentPosition - MaxItems);
                 break;
 
+            case Key.Space:
+                LaunchSelected();
+                break;
+
             case Key.Return:
                 MenuList selected = menuList[selectedItem];
 
@@ -174,9 +183,16 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                 break;
 
             case Key.LeftArrow:
-                ProcessCommand(
-                    menuList[selectedItem].Command + ".left",
-                    menuList[selectedItem].Args);
+                if (ChangesWithLeftRight(menuList[selectedItem].Command))
+                {
+                    ProcessCommand(
+                        menuList[selectedItem].Command + ".left",
+                        menuList[selectedItem].Args);
+                }
+                else
+                {
+                    GoBack();
+                }
                 break;
 
             case Key.RightArrow:
@@ -190,7 +206,10 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                 break;
 
             case Key.Backspace:
-                EditNetworkAddress(remove: true);
+                if (menuList[selectedItem].Command == "connect")
+                    EditNetworkAddress(remove: true);
+                else
+                    GoBack();
                 break;
 
             default:
@@ -229,11 +248,17 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
         selectedItem = 0;
         currentPosition = 0;
 
+        backTarget = "return";
+
         menuList.Add(new MenuList("Display", "display"));
         menuList.Add(new MenuList("Audio", "audio"));
         menuList.Add(new MenuList("Input", "input"));
+        menuList.Add(new MenuList("Hot Keys", "hotkeys"));
         menuList.Add(new MenuList("Network", "network"));
         menuList.Add(new MenuList("Load Program / Media", "load"));
+        menuList.Add(new MenuList("Save State", "savestate"));
+        menuList.Add(new MenuList("Load State", "loadstate"));
+        menuList.Add(new MenuList("Rewind", "rewind"));
         menuList.Add(new MenuList("Soft Reset", "softreset"));
         menuList.Add(new MenuList("Hard Reset", "hardreset"));
         menuList.Add(
@@ -420,6 +445,9 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
         try
         {
             DirectoryInfo info = new DirectoryInfo(directory);
+            mediaDirectory = info.FullName;
+            backTarget = "up";
+            RememberDirectory(info);
 
             if (info.Parent is not null)
             {
@@ -451,6 +479,7 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                 {
                     ".d64" => "[D64] " + Shorten(file.Name, 30),
                     ".t64" => "[T64] " + Shorten(file.Name, 30),
+                    ".tap" => "[TAP] " + Shorten(file.Name, 30),
                     ".crt" => "[CRT] " + Shorten(file.Name, 30),
                     ".prg" => "[PRG] " + Shorten(file.Name, 30),
                     _ => null
@@ -486,6 +515,8 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
             LoadMainMenu();
             return;
         }
+
+        backTarget = "browse";
 
         var image = Path.GetFileName(machine.Drive.ImagePath ?? "Disk");
         menuList.Add(new MenuList("Back to Main Menu", "main"));
@@ -523,6 +554,8 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
             return;
         }
 
+        backTarget = "browse";
+
         var image = Path.GetFileName(machine.Tape.ImagePath ?? "Tape");
         menuList.Add(new MenuList("Back to Main Menu", "main"));
         menuList.Add(new MenuList("Eject Tape", "ejecttape"));
@@ -530,7 +563,7 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
 
         var programs = 0;
 
-        foreach (T64FileInfo file in machine.Tape.Directory)
+        foreach (ITapeFileInfo file in machine.Tape.Directory)
         {
             if (file.Type != CbmFileType.Program)
                 continue;
@@ -556,6 +589,8 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
         selectedItem = 0;
         currentPosition = 0;
 
+        backTarget = "input";
+
         KeySet keys = keyset == 1 ? machine.Cia1.KeySet1 : machine.Cia1.KeySet2;
         var prefix = "KeySet" + keyset;
 
@@ -567,28 +602,58 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
         menuList.Add(new MenuList(prefix + " Fire: " + keys.Fire, "keyset" + keyset, ["fire"]));
     }
 
+    private void LoadHotKeysMenu()
+    {
+        menuList.Clear();
+        selectedItem = 0;
+        currentPosition = 0;
+        backTarget = "main";
+
+        menuList.Add(new MenuList("Back to Main Menu", "main"));
+        menuList.Add(new MenuList("F5: Save quick state", string.Empty));
+        menuList.Add(new MenuList("F6: Rewind one step", string.Empty));
+        menuList.Add(new MenuList("F7: Load quick state", string.Empty));
+        menuList.Add(new MenuList("F9 (hold): Warp / fast forward", string.Empty));
+        menuList.Add(new MenuList("F10: Save diagnostic dump", string.Empty));
+        menuList.Add(new MenuList("F11: Swap joysticks", string.Empty));
+        menuList.Add(new MenuList("F12 / Esc: Open or close menu", string.Empty));
+        menuList.Add(new MenuList("Up / Down: Move, Page: Jump", string.Empty));
+        menuList.Add(new MenuList("Enter: Select   Space: Launch", string.Empty));
+        menuList.Add(new MenuList("Left / Backspace: Go back", string.Empty));
+        menuList.Add(new MenuList("Left / Right: Change a setting", string.Empty));
+    }
+
     private void ProcessCommand(string command, string[] args)
     {
         switch (command)
         {
             case "display":
+                backTarget = "main";
                 LoadDisplayMenu();
                 break;
 
             case "audio":
+                backTarget = "main";
                 LoadAudioMenu();
                 break;
 
             case "input":
+                backTarget = "main";
                 LoadInputMenu();
                 break;
 
+            case "hotkeys":
+                backTarget = "main";
+                LoadHotKeysMenu();
+                break;
+
             case "network":
+                backTarget = "main";
                 LoadNetworkMenu();
                 break;
 
             case "load":
-                LoadFileMenu(AppContext.BaseDirectory);
+                LoadFileMenu(ResolveMediaDirectory());
                 break;
 
             case "loadfile":
@@ -612,6 +677,7 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                             break;
 
                         case ".t64":
+                        case ".tap":
                             machine.MountTape(args[0]);
                             LoadTapeMenu();
                             renderer.DisplayStatus("Mounted " + Path.GetFileName(args[0]));
@@ -686,6 +752,50 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                     {
                         renderer.DisplayStatus("Disk load failed: " + ex.Message);
                     }
+                }
+                break;
+
+            case "savestate":
+                try
+                {
+                    machine.SaveStateToFile();
+                    renderer.DisplayStatus("State saved");
+                }
+                catch (Exception ex)
+                {
+                    renderer.DisplayStatus("Save state failed: " + ex.Message);
+                }
+                break;
+
+            case "loadstate":
+                try
+                {
+                    machine.LoadStateFromFile();
+                    MenuReturn?.Invoke();
+                    renderer.DisplayStatus("State loaded");
+                }
+                catch (Exception ex)
+                {
+                    renderer.DisplayStatus("Load state failed: " + ex.Message);
+                }
+                break;
+
+            case "rewind":
+                try
+                {
+                    if (machine.RewindOneStep(out var message))
+                    {
+                        MenuReturn?.Invoke();
+                        renderer.DisplayStatus(message);
+                    }
+                    else
+                    {
+                        renderer.DisplayStatus(message);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    renderer.DisplayStatus("Rewind failed: " + ex.Message);
                 }
                 break;
 
@@ -857,6 +967,176 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                 LoadKeySetMenu(2);
                 break;
         }
+    }
+
+    /// <summary>
+    /// One-line help for the highlighted item. Only media files can be
+    /// launched directly, so only they show a shortcut.
+    /// </summary>
+    private string HintText
+    {
+        get
+        {
+            if (selectedItem >= menuList.Count)
+                return string.Empty;
+
+            MenuList selected = menuList[selectedItem];
+
+            if (selected.Command == "directory")
+                return "Enter: Open   Backspace: Back";
+
+            if (selected.Command != "loadfile" || selected.Args.Length == 0)
+                return string.Empty;
+
+            return Path.GetExtension(selected.Args[0]).ToLowerInvariant() switch
+            {
+                ".d64" => "Space: Launch   Enter: Explore disk",
+                ".t64" => "Space: Launch   Enter: Explore tape",
+                ".tap" => "Space: Launch   Enter: Explore tape",
+                ".prg" => "Space: Launch",
+                ".crt" => "Space: Launch",
+                _ => string.Empty
+            };
+        }
+    }
+
+    private void LaunchSelected()
+    {
+        if (selectedItem >= menuList.Count)
+            return;
+
+        MenuList selected = menuList[selectedItem];
+
+        if (selected.Command != "loadfile" || selected.Args.Length == 0)
+            return;
+
+        LaunchFile(selected.Args[0]);
+    }
+
+    /// <summary>
+    /// Loads the highlighted media without opening its own list. A disk or
+    /// tape is booted the way a real C64 would: the BASIC command is typed
+    /// into the keyboard buffer, so a boot loader sees the same state it
+    /// would after a manual LOAD followed by RUN.
+    /// </summary>
+    private void LaunchFile(string path)
+    {
+        var name = Path.GetFileName(path);
+
+        try
+        {
+            switch (Path.GetExtension(path).ToLowerInvariant())
+            {
+                case ".prg":
+                    machine.LoadProgram(path);
+                    MenuReturn?.Invoke();
+                    renderer.DisplayStatus("Loaded " + name);
+                    break;
+
+                case ".d64":
+                    machine.MountDisk(path);
+                    MenuReturn?.Invoke();
+                    machine.TypeText("LOAD\"*\",8,1\rRUN\r");
+                    renderer.DisplayStatus("Mounted " + name + ": LOAD\"*\",8,1");
+                    break;
+
+                case ".t64":
+                    machine.MountTape(path);
+                    MenuReturn?.Invoke();
+                    machine.TypeText("LOAD\"*\",1,1\rRUN\r");
+                    renderer.DisplayStatus("Mounted " + name + ": LOAD\"*\",1,1");
+                    break;
+
+                case ".tap":
+                    machine.MountTape(path);
+                    MenuReturn?.Invoke();
+                    machine.TypeText("LOAD\"\",1,1\rRUN\r");
+                    renderer.DisplayStatus("Mounted " + name + ": LOAD\"\",1,1");
+                    break;
+
+                case ".crt":
+                    machine.MountCartridge(path);
+                    MenuReturn?.Invoke();
+                    renderer.DisplayStatus("Mounted cartridge " + name);
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            renderer.DisplayStatus("Load failed: " + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Left arrow and Backspace step out one level. A setting keeps its
+    /// sideways adjustment, a folder goes to its parent, a disk or tape list
+    /// returns to the browser, and the main menu closes.
+    /// </summary>
+    private void GoBack()
+    {
+        switch (backTarget)
+        {
+            case "return":
+                MenuReturn?.Invoke();
+                break;
+
+            case "browse":
+                LoadFileMenu(ResolveMediaDirectory());
+                break;
+
+            case "up":
+                if (
+                    !string.IsNullOrEmpty(mediaDirectory) &&
+                    Directory.GetParent(mediaDirectory) is { } parent)
+                {
+                    LoadFileMenu(parent.FullName);
+                }
+                else
+                {
+                    LoadMainMenu();
+                }
+                break;
+
+            default:
+                ProcessCommand(backTarget, []);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Settings that answer Left and Right keep those keys instead of using
+    /// them to step back out of the menu.
+    /// </summary>
+    private static bool ChangesWithLeftRight(string command)
+    {
+        return command is "fps" or "vsync" or "audiodevice" or "volume" or "mute";
+    }
+
+    private static string ResolveMediaDirectory()
+    {
+        var directory = AppSettings.Current.LastMediaDirectory;
+
+        return !string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory)
+            ? directory
+            : AppContext.BaseDirectory;
+    }
+
+    private static void RememberDirectory(DirectoryInfo info)
+    {
+        if (!info.Exists)
+            return;
+
+        if (
+            string.Equals(
+                AppSettings.Current.LastMediaDirectory,
+                info.FullName,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        AppSettings.Current.LastMediaDirectory = info.FullName;
+        AppSettings.Current.Save();
     }
 
     private void UpdateItem(string command, string text)

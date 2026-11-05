@@ -505,6 +505,79 @@ internal sealed class EmuWin
         }
     }
 
+    private void SaveStateHotkey()
+    {
+        if (machine is null || renderer is null)
+            return;
+
+        if (network?.IsClient == true)
+        {
+            renderer.DisplayStatus("Save state is unavailable as a client");
+            return;
+        }
+
+        try
+        {
+            machine.SaveStateToFile();
+            renderer.DisplayStatus("State saved");
+        }
+        catch (Exception exception)
+        {
+            renderer.DisplayStatus("Save state failed: " + exception.Message);
+        }
+    }
+
+    private void LoadStateHotkey()
+    {
+        if (machine is null || renderer is null)
+            return;
+
+        if (network?.IsClient == true)
+        {
+            renderer.DisplayStatus("Load state is unavailable as a client");
+            return;
+        }
+
+        try
+        {
+            machine.LoadStateFromFile();
+            renderer.ResetBuffer();
+            renderer.DisplayStatus("State loaded");
+        }
+        catch (Exception exception)
+        {
+            renderer.DisplayStatus("Load state failed: " + exception.Message);
+        }
+    }
+
+    private void RewindHotkey()
+    {
+        if (machine is null || renderer is null)
+            return;
+
+        if (network?.IsClient == true)
+        {
+            renderer.DisplayStatus("Rewind is unavailable as a client");
+            return;
+        }
+
+        try
+        {
+            if (!machine.RewindOneStep(out var message))
+            {
+                renderer.DisplayStatus(message);
+                return;
+            }
+
+            renderer.ResetBuffer();
+            renderer.DisplayStatus(message);
+        }
+        catch (Exception exception)
+        {
+            renderer.DisplayStatus("Rewind failed: " + exception.Message);
+        }
+    }
+
     private void DumpLiveDiagnostic()
     {
         if (machine is null)
@@ -664,6 +737,21 @@ internal sealed class EmuWin
 
         switch (key.Key)
         {
+            case Key.F5:
+                if (key.Down)
+                    SaveStateHotkey();
+                return;
+
+            case Key.F6:
+                if (key.Down)
+                    RewindHotkey();
+                return;
+
+            case Key.F7:
+                if (key.Down)
+                    LoadStateHotkey();
+                return;
+
             case Key.F9:
                 if (key.Down)
                 {

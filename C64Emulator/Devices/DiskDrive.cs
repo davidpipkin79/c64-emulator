@@ -79,6 +79,19 @@ internal sealed class DiskDrive
         RealDrive?.Mount(d64, path);
     }
 
+    public void SaveFile(string name, byte[] program)
+    {
+        D64Image? mounted = image;
+
+        if (mounted is null)
+            throw new InvalidOperationException("No disk is mounted.");
+
+        mounted.SaveFile(name, program);
+
+        if (ImagePath is not null)
+            mounted.Save(ImagePath);
+    }
+
     public void Eject()
     {
         RealDrive?.Eject();

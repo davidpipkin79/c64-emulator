@@ -84,6 +84,11 @@ internal sealed class Cia2(
         }
     }
 
+    internal void RefreshPorts()
+    {
+        UpdateVideoBank();
+    }
+
     private void UpdateVideoBank()
     {
         // CIA2 port A bits 0-1 drive the VIC bank through an inverter. Input

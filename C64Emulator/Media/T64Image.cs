@@ -12,7 +12,7 @@ internal sealed class T64FileInfo(
     ushort startAddress,
     ushort endAddress,
     int dataOffset,
-    int dataLength)
+    int dataLength) : ITapeFileInfo
 {
     public string Name { get; } = name;
 

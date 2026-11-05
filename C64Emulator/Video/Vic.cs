@@ -88,6 +88,13 @@ internal sealed class Vic : IVideoBank
     private readonly int[] spriteMemptr = new int[8];
     private readonly bool[] spriteExpandFlip = new bool[8];
 
+    // Derived per-line timing/visibility masks. They are rebuilt from the
+    // sprite state and are deliberately not serialized as save state.
+    [NonSerialized] private ulong spriteFetchMask;
+    [NonSerialized] private ulong spriteLeadMask;
+    [NonSerialized] private byte lineSpriteMask;
+    [NonSerialized] private readonly sbyte[] spriteFetchOwner = new sbyte[64];
+
     // Sprite data for the next raster line is fetched in the sprite's
     // bus slots during the current line, then swapped in at the line
     // boundary. The graphics bytes are latched the same way: fetched on
@@ -197,6 +204,10 @@ internal sealed class Vic : IVideoBank
         Array.Clear(spriteDmaRemaining);
         Array.Clear(spriteMemptr);
         Array.Clear(spriteExpandFlip);
+        Array.Fill(spriteFetchOwner, (sbyte)-1);
+        spriteFetchMask = 0;
+        spriteLeadMask = 0;
+        lineSpriteMask = 0;
         Array.Clear(spriteData);
         Array.Clear(spriteNextData);
         matrixRowStart = 0;
@@ -207,6 +218,21 @@ internal sealed class Vic : IVideoBank
         UpdateVideoMatrixAddress();
         UpdatePixelMatrixAddress();
         interrupts.Set(InterruptSource.Vic, false);
+    }
+
+    internal void RefreshSpriteCachesForState()
+    {
+        RefreshSpriteCaches();
+    }
+
+    internal void ClearFrameBuffers()
+    {
+        lock (screenLock)
+        {
+            Array.Clear(frontBuffer);
+            Array.Clear(backBuffer);
+            frameRendered = false;
+        }
     }
 
     public int RegistersPosition => AddressMap.VicStart;
@@ -513,6 +539,16 @@ internal sealed class Vic : IVideoBank
                 sprites[register - 0x27].SpriteColor = C64Palette.Get(value);
                 break;
         }
+
+        // Sprite Y, enable and height affect the next line's DMA lead-in
+        // and the set of sprites that can appear on this raster line.
+        if (
+            (register >= 0x01 && register <= 0x0F && (register & 1) != 0) ||
+            register == 0x15 ||
+            register == 0x17)
+        {
+            RefreshSpriteCaches();
+        }
     }
 
     public byte[] CapturePackedScreen()
@@ -593,16 +629,23 @@ internal sealed class Vic : IVideoBank
         var firstFrontSprite = -1;
         RgbColor firstSpriteColor = C64Palette.Get(0);
         RgbColor firstFrontSpriteColor = C64Palette.Get(0);
+        var localX = x - SpriteXOrigin;
 
         for (var sprite = 0; sprite < 8; sprite++)
         {
-            if (!sprites[sprite].Enabled)
+            if ((lineSpriteMask & (1 << sprite)) == 0)
                 continue;
 
-            Pixel spritePixel = GetSpritePixel(
-                sprite,
-                x - SpriteXOrigin,
-                y);
+            ref Sprite spriteState = ref sprites[sprite];
+
+            if (
+                localX < spriteState.X ||
+                localX >= spriteState.X + spriteState.Width)
+            {
+                continue;
+            }
+
+            Pixel spritePixel = GetSpritePixel(sprite, localX);
 
             if (spritePixel.Background)
                 continue;
@@ -704,26 +747,20 @@ internal sealed class Vic : IVideoBank
         return GetPixel(sourceX - FirstScreenPixel, sourceY);
     }
 
-    private Pixel GetSpritePixel(int sprite, int x, int y)
+    private Pixel GetSpritePixel(int sprite, int x)
     {
         ref Sprite spriteState = ref sprites[sprite];
 
         if (
             x < spriteState.X ||
-            x >= spriteState.X + spriteState.Width ||
-            y < spriteState.Y + 1 ||
-            y >= spriteState.Y + 1 + spriteState.Height)
+            x >= spriteState.X + spriteState.Width)
         {
             return emptyPixel;
         }
 
         var xOffset = x - spriteState.X;
-        var yOffset = y - spriteState.Y - 1;
 
         xOffset /= spriteState.PixelScale;
-
-        if (spriteState.Height == 42)
-            yOffset /= 2;
 
         // The three bytes shown on this raster line were fetched in the
         // sprite's bus slots during the previous line.
@@ -928,9 +965,12 @@ internal sealed class Vic : IVideoBank
         if (cycle >= 16 && cycle <= 55)
             FetchGlyphCell(cycle - 16);
 
-        FetchSpriteLine(cycle);
+        var fetchSprite = spriteFetchOwner[cycle];
 
-        if (SpriteStealsCycle(cycle))
+        if (fetchSprite >= 0)
+            FetchSpriteLine(fetchSprite);
+
+        if ((spriteFetchMask & (1UL << cycle)) != 0)
             IncrementStolenCycles();
 
         if (!renderPixels)
@@ -1065,6 +1105,85 @@ internal sealed class Vic : IVideoBank
         }
 
         Array.Copy(spriteNextData, spriteData, spriteNextData.Length);
+        RefreshSpriteCaches();
+    }
+
+    private void RefreshSpriteCaches()
+    {
+        UpdateSpriteBusMasks();
+        UpdateSpriteLineMask();
+    }
+
+    /// <summary>
+    /// Builds the two bus masks once per raster line instead of scanning
+    /// every sprite on every CPU access. The fetch mask covers the two
+    /// AEC cycles, while the lead mask covers the three BA cycles before
+    /// each fetch, including the tail of the previous line for sprite 3.
+    /// </summary>
+    private void UpdateSpriteBusMasks()
+    {
+        ulong fetch = 0;
+        ulong lead = 0;
+        var lineCycles = GetLineCycles(currentHLine);
+
+        Array.Fill(spriteFetchOwner, (sbyte)-1);
+
+        for (var sprite = 0; sprite < sprites.Length; sprite++)
+        {
+            if (spriteDmaActive[sprite])
+            {
+                var firstCycle = GetSpriteFetchCycle(sprite);
+
+                fetch |= 1UL << firstCycle;
+                fetch |= 1UL << (firstCycle + 1);
+                spriteFetchOwner[firstCycle] = (sbyte)sprite;
+
+                var leadStart = Math.Max(0, firstCycle - 3);
+
+                for (var cycle = leadStart; cycle < firstCycle; cycle++)
+                    lead |= 1UL << cycle;
+            }
+
+            if (!WillSpriteDmaBeActiveOnNextLine(sprite))
+                continue;
+
+            var nextFirstCycle = GetSpriteFetchCycle(sprite);
+
+            if (nextFirstCycle >= 3)
+                continue;
+
+            for (
+                var cycle = Math.Max(0, lineCycles + nextFirstCycle - 3);
+                cycle < lineCycles;
+                cycle++)
+            {
+                lead |= 1UL << cycle;
+            }
+        }
+
+        spriteFetchMask = fetch;
+        spriteLeadMask = lead;
+    }
+
+    private void UpdateSpriteLineMask()
+    {
+        byte mask = 0;
+        var y = currentHLine;
+
+        for (var sprite = 0; sprite < sprites.Length; sprite++)
+        {
+            ref Sprite spriteState = ref sprites[sprite];
+
+            if (
+                spriteState.Enabled &&
+                y >= spriteState.Y + 1 &&
+                y < spriteState.Y + 1 + spriteState.Height)
+            {
+                mask |= (byte)(1 << sprite);
+            }
+        }
+
+        lineSpriteMask = mask;
     }
 
     /// <summary>
@@ -1073,45 +1192,21 @@ internal sealed class Vic : IVideoBank
     /// are read once per line, exactly like the real chip, instead of
     /// being re-read for every rendered pixel.
     /// </summary>
-    private void FetchSpriteLine(int cycle)
+    private void FetchSpriteLine(int sprite)
     {
-        for (var sprite = 0; sprite < sprites.Length; sprite++)
+        if (!spriteDmaActive[sprite])
+            return;
+
+        var pointerAddress = (ushort)(videoMatrixAddress + 0x3F8 + sprite);
+        var spriteBase = (ushort)(
+            bankAddress + bus.Read(pointerAddress) * 0x40);
+        var memptr = spriteMemptr[sprite];
+
+        for (var i = 0; i < 3; i++)
         {
-            if (!spriteDmaActive[sprite] || cycle != GetSpriteFetchCycle(sprite))
-                continue;
-
-            var pointerAddress = (ushort)(videoMatrixAddress + 0x3F8 + sprite);
-            var spriteBase = (ushort)(
-                bankAddress + bus.Read(pointerAddress) * 0x40);
-            var memptr = spriteMemptr[sprite];
-
-            for (var i = 0; i < 3; i++)
-            {
-                spriteNextData[sprite * 3 + i] = bus.Read(
-                    (ushort)(spriteBase + ((memptr + i) & 0x3F)));
-            }
+            spriteNextData[sprite * 3 + i] = bus.Read(
+                (ushort)(spriteBase + ((memptr + i) & 0x3F)));
         }
-    }
-
-    private bool SpriteStealsCycle(int cycle)
-    {
-        return IsSpriteFetchCycle(cycle);
-    }
-
-    private bool IsSpriteFetchCycle(int cycle)
-    {
-        for (var sprite = 0; sprite < sprites.Length; sprite++)
-        {
-            if (!spriteDmaActive[sprite])
-                continue;
-
-            var firstCycle = GetSpriteFetchCycle(sprite);
-
-            if (cycle == firstCycle || cycle == firstCycle + 1)
-                return true;
-        }
-
-        return false;
     }
 
     private bool IsAecLow(int cycle)
@@ -1119,7 +1214,8 @@ internal sealed class Vic : IVideoBank
         if (lineIsBadline && cycle >= 15 && cycle <= 54)
             return true;
 
-        return IsSpriteFetchCycle(cycle);
+        return (uint)cycle < 64 &&
+            (spriteFetchMask & (1UL << cycle)) != 0;
     }
 
     private bool IsBaLow(int cycle)
@@ -1132,39 +1228,8 @@ internal sealed class Vic : IVideoBank
         if (lineIsBadline && cycle >= 12 && cycle < 15)
             return true;
 
-        for (var sprite = 0; sprite < sprites.Length; sprite++)
-        {
-            if (!spriteDmaActive[sprite])
-                continue;
-
-            var firstCycle = GetSpriteFetchCycle(sprite);
-            var leadStart = Math.Max(0, firstCycle - 3);
-
-            if (cycle >= leadStart && cycle < firstCycle)
-                return true;
-        }
-
-        // Sprite 3's first fetch is on cycle 0, so its BA lead-in lives in
-        // the last three cycles of the previous raster line.
-        var lineCycles = GetLineCycles(currentHLine);
-
-        for (var sprite = 0; sprite < sprites.Length; sprite++)
-        {
-            if (!WillSpriteDmaBeActiveOnNextLine(sprite))
-                continue;
-
-            var firstCycle = GetSpriteFetchCycle(sprite);
-
-            if (firstCycle >= 3)
-                continue;
-
-            var leadStart = lineCycles + firstCycle - 3;
-
-            if (cycle >= leadStart)
-                return true;
-        }
-
-        return false;
+        return (uint)cycle < 64 &&
+            (spriteLeadMask & (1UL << cycle)) != 0;
     }
 
     private bool WillSpriteDmaBeActiveOnNextLine(int sprite)

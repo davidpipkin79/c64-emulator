@@ -72,8 +72,11 @@ internal sealed class C64Machine : IDisposable
     public static long FrameDurationTicks => FrameTicks;
 
     private readonly ManualResetEventSlim pauseGate = new ManualResetEventSlim(true);
+    private readonly ManualResetEventSlim pauseAcknowledged = new(false);
     private readonly Lock lifecycleLock = new();
     private readonly CpuBusClock cpuBusClock;
+    private int pauseGeneration;
+    private int pauseAcknowledgedGeneration;
 
     private Thread? thread;
     private volatile bool stopRequested;
@@ -82,10 +85,29 @@ internal sealed class C64Machine : IDisposable
     private volatile bool running;
     private int speedPercentage = 100;
     private int frameReady;
+    private int frameCycles;
     private long nextWarpRender;
+
+    private const int RewindCapacity = 60;
+    private const int RewindIntervalFrames = 6;
+    private readonly Lock rewindLock = new();
+    private readonly List<byte[]> rewindStates = [];
+    private int rewindIndex = -1;
+    private int rewindFrameCounter;
+    private bool rewindEnabled = true;
+
     private readonly Dictionary<int, KernalChannel> kernalChannels = new Dictionary<int, KernalChannel>();
     private int kernalInputChannel;
     private int kernalOutputChannel;
+    private TapeWildcardRestore? tapeWildcardRestore;
+
+    // KERNAL keyboard buffer: ten bytes at $0277 with the count at $C6.
+    private const ushort KeyboardBufferAddress = 0x0277;
+    private const int KeyboardBufferCapacity = 10;
+
+    private readonly Queue<byte> typeAhead = new();
+    private readonly Lock typeAheadLock = new();
+    private int typeAheadPending;
 
     public C64Machine(RomSet roms, byte[]? driveRom = null)
     {
@@ -103,6 +125,8 @@ internal sealed class C64Machine : IDisposable
         Tape = new TapeDrive();
         Cia1 = new Cia1(Interrupts);
         Cia2 = new Cia2(Interrupts, Vic, Iec);
+        Tape.AttachReadLine(Cia1.SetFlag);
+        Memory.ProcessorPortWritten = OnProcessorPortWritten;
         Io = new IoController(Vic, Sid, ColorRam, Cia1, Cia2);
         Memory.Configure(roms, Io);
         cpuBusClock = new CpuBusClock(this);
@@ -148,9 +172,15 @@ internal sealed class C64Machine : IDisposable
             paused = value;
 
             if (paused)
+            {
+                Interlocked.Increment(ref pauseGeneration);
+                pauseAcknowledged.Reset();
                 pauseGate.Reset();
+            }
             else
+            {
                 pauseGate.Set();
+            }
         }
     }
 
@@ -190,10 +220,17 @@ internal sealed class C64Machine : IDisposable
             Drive.TrueDriveEmulation = value;
             CloseAllKernalChannels();
             Drive.Reset();
+            ResetRewind();
         }
     }
 
     public int SpeedPercentage => Volatile.Read(ref speedPercentage);
+
+    internal int FrameCycles
+    {
+        get => frameCycles;
+        set => frameCycles = value;
+    }
 
     public bool IsRunning => running;
 
@@ -207,6 +244,8 @@ internal sealed class C64Machine : IDisposable
             stopRequested = false;
             paused = false;
             pauseGate.Set();
+            frameCycles = 0;
+            ResetRewind();
             Cpu.Reset();
             Drive.Reset();
             Sid.DiscardSamples();
@@ -266,6 +305,192 @@ internal sealed class C64Machine : IDisposable
         return Interlocked.Exchange(ref frameReady, 0) != 0;
     }
 
+    internal void ResetFrameReady()
+    {
+        Interlocked.Exchange(ref frameReady, 0);
+    }
+
+    /// <summary>
+    /// Default quick-save slot. It lives beside the executable so it is
+    /// easy to find and does not depend on the launch directory.
+    /// </summary>
+    public static string DefaultStatePath =>
+        Path.Combine(AppContext.BaseDirectory, "savestate.c64state");
+
+    /// <summary>
+    /// Pauses the emulation thread and waits until it has actually reached
+    /// the pause gate. Safe to call when the machine is already paused.
+    /// </summary>
+    public void PauseAndWait()
+    {
+        if (!running)
+        {
+            Paused = true;
+            return;
+        }
+
+        if (Thread.CurrentThread == thread)
+            return;
+
+        if (!paused)
+            Paused = true;
+
+        int generation = Volatile.Read(ref pauseGeneration);
+        long deadline = Environment.TickCount64 + 2000;
+
+        while (Volatile.Read(ref pauseAcknowledgedGeneration) != generation)
+        {
+            if (!running)
+                return;
+
+            if (Environment.TickCount64 > deadline)
+            {
+                throw new TimeoutException(
+                    "The emulation thread did not pause in time.");
+            }
+
+            Thread.Sleep(1);
+        }
+    }
+
+    public T WithPaused<T>(Func<T> action)
+    {
+        var wasPaused = Paused;
+
+        try
+        {
+            PauseAndWait();
+            return action();
+        }
+        finally
+        {
+            if (!wasPaused)
+                Paused = false;
+        }
+    }
+
+    public void WithPaused(Action action)
+    {
+        WithPaused(() =>
+        {
+            action();
+            return true;
+        });
+    }
+
+    public void SaveStateToFile(string? path = null)
+    {
+        var target = path ?? DefaultStatePath;
+        var directory = Path.GetDirectoryName(target);
+
+        if (!string.IsNullOrEmpty(directory))
+            Directory.CreateDirectory(directory);
+
+        WithPaused(() =>
+        {
+            byte[] state = MachineState.Capture(this, flushMedia: true);
+            File.WriteAllBytes(target, state);
+            AddRewindState(state);
+        });
+    }
+
+    public void LoadStateFromFile(string? path = null)
+    {
+        byte[] state = File.ReadAllBytes(path ?? DefaultStatePath);
+
+        WithPaused(() =>
+        {
+            MachineState.Restore(this, state);
+            ResetRewind();
+            AddRewindState(state);
+        });
+    }
+
+    public bool RewindOneStep(out string message)
+    {
+        var wasPaused = Paused;
+
+        try
+        {
+            PauseAndWait();
+
+            lock (rewindLock)
+            {
+                if (rewindStates.Count == 0)
+                {
+                    message = "No rewind history";
+                    return false;
+                }
+
+                if (rewindIndex > 0)
+                    rewindIndex--;
+
+                MachineState.Restore(this, rewindStates[rewindIndex]);
+
+                if (rewindIndex < rewindStates.Count - 1)
+                {
+                    rewindStates.RemoveRange(
+                        rewindIndex + 1,
+                        rewindStates.Count - rewindIndex - 1);
+                }
+
+                message = rewindIndex == 0
+                    ? "Start of rewind buffer"
+                    : "Rewound";
+                return true;
+            }
+        }
+        finally
+        {
+            if (!wasPaused)
+                Paused = false;
+        }
+    }
+
+    private void ResetRewind()
+    {
+        lock (rewindLock)
+        {
+            rewindStates.Clear();
+            rewindIndex = -1;
+            rewindFrameCounter = 0;
+            rewindEnabled = true;
+        }
+    }
+
+    private void AddRewindState(byte[] state)
+    {
+        lock (rewindLock)
+        {
+            if (rewindIndex >= 0 && rewindIndex < rewindStates.Count - 1)
+            {
+                rewindStates.RemoveRange(
+                    rewindIndex + 1,
+                    rewindStates.Count - rewindIndex - 1);
+            }
+
+            rewindStates.Add(state);
+
+            if (rewindStates.Count > RewindCapacity)
+                rewindStates.RemoveAt(0);
+
+            rewindIndex = rewindStates.Count - 1;
+        }
+    }
+
+    private void CaptureRewindSnapshot()
+    {
+        try
+        {
+            AddRewindState(MachineState.Capture(this, flushMedia: false));
+        }
+        catch (Exception ex)
+        {
+            rewindEnabled = false;
+            Debug.WriteLine("Rewind capture failed: " + ex.Message);
+        }
+    }
+
     /// <summary>
     /// Runs a bounded number of CPU cycles synchronously. Intended for
     /// tests and deterministic boot probes, not for the interactive loop.
@@ -287,11 +512,14 @@ internal sealed class C64Machine : IDisposable
 
     public void SoftReset()
     {
+        CancelPulseTapeWildcardRestore();
         Cpu.Reset();
+        ResetRewind();
     }
 
     public void HardReset()
     {
+        CancelPulseTapeWildcardRestore();
         var restart = running;
 
         if (restart)
@@ -299,6 +527,8 @@ internal sealed class C64Machine : IDisposable
 
         Cpu.Reset();
         Memory.ResetProcessorPort();
+        Tape.ResetPlayback();
+        RefreshTapeSense();
         Vic.Reset();
         Cia1.Reset();
         Cia2.Reset();
@@ -306,6 +536,8 @@ internal sealed class C64Machine : IDisposable
         Sid.Reset();
         Interrupts.Clear();
         CloseAllKernalChannels();
+        frameCycles = 0;
+        ResetRewind();
 
         if (restart)
             Start();
@@ -319,14 +551,60 @@ internal sealed class C64Machine : IDisposable
         LoadProgramBytes(program, run: true);
     }
 
+    /// <summary>
+    /// Queues text as if it had been typed on the keyboard. The KERNAL buffer
+    /// only holds ten characters, so the queue is drained into it as the
+    /// screen editor consumes them. Characters are plain PETSCII: uppercase
+    /// ASCII and <c>\r</c> map directly.
+    /// </summary>
+    public void TypeText(string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+
+        lock (typeAheadLock)
+        {
+            foreach (var character in text)
+                typeAhead.Enqueue(character <= 0x7E ? (byte)character : (byte)'?');
+        }
+
+        Interlocked.Exchange(ref typeAheadPending, 1);
+    }
+
+    private void PumpTypeAhead()
+    {
+        if (Volatile.Read(ref typeAheadPending) == 0)
+            return;
+
+        lock (typeAheadLock)
+        {
+            while (typeAhead.Count > 0)
+            {
+                var count = (int)Memory.Peek(0xC6);
+
+                if (count >= KeyboardBufferCapacity)
+                    break;
+
+                Memory.Poke(
+                    (ushort)(KeyboardBufferAddress + count),
+                    typeAhead.Dequeue());
+                Memory.Poke(0xC6, (byte)(count + 1));
+            }
+
+            if (typeAhead.Count == 0)
+                Interlocked.Exchange(ref typeAheadPending, 0);
+        }
+    }
+
     public void MountDisk(string path)
     {
         Drive.Mount(path);
+        ResetRewind();
     }
 
     public void EjectDisk()
     {
         Drive.Eject();
+        ResetRewind();
     }
 
     public void LoadDiskProgram(string name)
@@ -341,12 +619,46 @@ internal sealed class C64Machine : IDisposable
 
     public void MountTape(string path)
     {
+        CancelPulseTapeWildcardRestore();
         Tape.Mount(path);
+        Tape.SetMotor(false);
+        RefreshTapeSense();
+        ResetRewind();
+    }
+
+    public void MountTape(TapImage tap, string? path = null)
+    {
+        CancelPulseTapeWildcardRestore();
+        Tape.Mount(tap, path);
+        Tape.SetMotor(false);
+        RefreshTapeSense();
+        ResetRewind();
     }
 
     public void EjectTape()
     {
+        CancelPulseTapeWildcardRestore();
         Tape.Eject();
+        RefreshTapeSense();
+        ResetRewind();
+    }
+
+    /// <summary>
+    /// TAP playback presents the datasette's PLAY switch as pressed. The
+    /// T64 virtual loader does not use the processor port, so it leaves the
+    /// SENSE input released.
+    /// </summary>
+    internal void RefreshTapeSense()
+    {
+        Memory.ProcessorPortInput = Tape.UsesPulsePlayback
+            ? (byte)0x00
+            : (byte)0x10;
+    }
+
+    private void OnProcessorPortWritten(byte value)
+    {
+        // The cassette motor is active-low on port bit 5.
+        Tape.SetMotor((value & 0x20) == 0);
     }
 
     public void MountCartridge(string path)
@@ -365,7 +677,7 @@ internal sealed class C64Machine : IDisposable
 
     public void LoadTapeProgram(string name)
     {
-        T64FileInfo file = Tape.FindFile(name) ??
+        ITapeFileInfo file = Tape.FindFile(name) ??
             throw new FileNotFoundException("File not found on tape: " + name);
 
         var program = Tape.CreatePrg(file);
@@ -374,6 +686,8 @@ internal sealed class C64Machine : IDisposable
 
     private void LoadProgramBytes(byte[] program, bool run)
     {
+        ResetRewind();
+
         if (program.Length < 2)
             throw new InvalidDataException("Program file is too short.");
 
@@ -479,6 +793,7 @@ internal sealed class C64Machine : IDisposable
 
     private int StepCpu()
     {
+        PumpTypeAhead();
         cpuBusClock.Begin();
 
         // The core issues every cycle itself: reads, writes and internal
@@ -507,17 +822,21 @@ internal sealed class C64Machine : IDisposable
 
         if ((pc == 0xFFD5 || pc == 0xF49E) && !interruptPending)
         {
+            NormalizePulseTapeWildcard();
             var device = Memory.Peek(0xBA);
 
             if (
                 (device == 1 || device == 8) &&
-                !(device == 8 && Drive.HardwareDriveActive))
+                !(device == 8 && Drive.HardwareDriveActive) &&
+                !(device == 1 && Tape.UsesPulsePlayback))
             {
                 return HandleKernalLoad(device);
             }
         }
 
-        return Cpu.Step();
+        var cycles = Cpu.Step();
+        RestorePulseTapeWildcardIfReturned();
+        return cycles;
     }
 
     private bool InterruptPending()
@@ -526,6 +845,51 @@ internal sealed class C64Machine : IDisposable
             return true;
 
         return Interrupts.IsIrqAsserted && (Cpu.P & 0x04) == 0;
+    }
+
+    private int? SaveKernalFile()
+    {
+        if (Memory.Peek(0xBA) != 8)
+            return null;
+
+        if (!Drive.IsMounted)
+            return CompleteKernalIo(5); // DEVICE NOT PRESENT
+
+        var name = ReadKernalFilename();
+
+        if (name.Length == 0 || name == "*" || name == "$")
+            return CompleteKernalIo(8); // MISSING FILE NAME
+
+        // SAVE receives a zero-page offset in A, with the actual start
+        // address stored at that offset, and an end address plus one in X/Y.
+        var start = Memory.PeekWord(Cpu.A);
+        var end = (ushort)(Cpu.X | (Cpu.Y << 8));
+
+        if (end <= start)
+            return CompleteKernalIo(8);
+
+        var length = end - start;
+        var program = new byte[length + 2];
+        program[0] = (byte)(start & 0xFF);
+        program[1] = (byte)(start >> 8);
+
+        for (var i = 0; i < length; i++)
+            program[i + 2] = Memory.Peek((ushort)(start + i));
+
+        try
+        {
+            Drive.SaveFile(name, program);
+        }
+        catch (InvalidOperationException)
+        {
+            return CompleteKernalIo(8);
+        }
+        catch (IOException)
+        {
+            return CompleteKernalIo(8);
+        }
+
+        return CompleteKernalIo(0);
     }
 
     private int HandleKernalLoad(byte device)
@@ -599,7 +963,7 @@ internal sealed class C64Machine : IDisposable
         if (name == "$")
             return 4; // A directory listing is not provided through LOAD here.
 
-        T64FileInfo? file = Tape.FindFile(name);
+        ITapeFileInfo? file = Tape.FindFile(name);
 
         if (file is null)
             return 4; // FILE NOT FOUND
@@ -651,6 +1015,11 @@ internal sealed class C64Machine : IDisposable
 
     private int? HandleKernalIo(ushort pc)
     {
+        // A TAP image is serviced by the real KERNAL tape routines through
+        // the CIA FLAG line, not by the virtual fast path.
+        if (Tape.UsesPulsePlayback && Memory.Peek(0xBA) == 1)
+            return null;
+
         // With a hardware 1541 attached, the KERNAL must talk to it over
         // the IEC bus instead of using the virtual disk fast path.
         if (Drive.HardwareDriveActive && Memory.Peek(0xBA) == 8)
@@ -698,6 +1067,9 @@ internal sealed class C64Machine : IDisposable
             case 0xFFD2: // CHROUT
                 return WriteKernalChannel();
 
+            case 0xFFD8: // SAVE
+                return SaveKernalFile();
+
             case 0xFFE7: // CLALL
                 if (kernalChannels.Count == 0)
                     return null;
@@ -718,6 +1090,9 @@ internal sealed class C64Machine : IDisposable
 
         if (device != 1 && device != 8)
             return false; // Let the KERNAL handle screen, printer, etc.
+
+        if (device == 1 && Tape.UsesPulsePlayback)
+            return false;
 
         int logical = Memory.Peek(0xB8);
 
@@ -767,7 +1142,7 @@ internal sealed class C64Machine : IDisposable
         }
         else
         {
-            T64FileInfo? file = Tape.FindFile(name);
+            ITapeFileInfo? file = Tape.FindFile(name);
 
             if (file is null)
             {
@@ -889,7 +1264,7 @@ internal sealed class C64Machine : IDisposable
             if (Tape.TapeName.Length > 0)
                 builder.Append(Tape.TapeName).Append('\r');
 
-            foreach (T64FileInfo file in Tape.Directory)
+            foreach (ITapeFileInfo file in Tape.Directory)
             {
                 builder
                     .Append(file.Name)
@@ -932,6 +1307,64 @@ internal sealed class C64Machine : IDisposable
         return new string(characters).Trim();
     }
 
+    /// <summary>
+    /// The stock KERNAL compares tape filenames literally, so LOAD"*" never
+    /// matches a header. Treat the common TAP form as an unnamed load of the
+    /// next header, while leaving disk and virtual T64 loads unchanged.
+    /// </summary>
+    private void NormalizePulseTapeWildcard()
+    {
+        if (
+            !Tape.UsesPulsePlayback ||
+            Memory.Peek(0xBA) != 1 ||
+            Memory.Peek(0xB7) != 1)
+        {
+            return;
+        }
+
+        var pointer = Memory.PeekWord(0xBB);
+
+        if (Memory.Peek(pointer) != (byte)'*')
+            return;
+
+        var stack = Cpu.S;
+        tapeWildcardRestore = new TapeWildcardRestore(
+            Memory.Peek(0xB7),
+            stack,
+            (ushort)(Memory.PeekWord((ushort)(0x0100 + stack + 1)) + 1));
+        Memory.Poke(0xB7, 0);
+    }
+
+    private void RestorePulseTapeWildcardIfReturned()
+    {
+        if (tapeWildcardRestore is not { } restore)
+            return;
+
+        if (
+            Cpu.GetPC() != restore.ReturnAddress ||
+            Cpu.S != (byte)(restore.Stack + 2))
+        {
+            return;
+        }
+
+        Memory.Poke(0xB7, restore.FilenameLength);
+        tapeWildcardRestore = null;
+    }
+
+    private void CancelPulseTapeWildcardRestore()
+    {
+        if (tapeWildcardRestore is not { } restore)
+            return;
+
+        Memory.Poke(0xB7, restore.FilenameLength);
+        tapeWildcardRestore = null;
+    }
+
+    private sealed record TapeWildcardRestore(
+        byte FilenameLength,
+        byte Stack,
+        ushort ReturnAddress);
+
     private sealed class KernalChannel(byte[] data)
     {
         public byte[] Data { get; } = data;
@@ -941,17 +1374,106 @@ internal sealed class C64Machine : IDisposable
         public List<byte> Output { get; } = [];
     }
 
+    internal void WriteKernalState(BinaryWriter writer)
+    {
+        writer.Write(kernalInputChannel);
+        writer.Write(kernalOutputChannel);
+        writer.Write(kernalChannels.Count);
+
+        foreach (KeyValuePair<int, KernalChannel> pair in kernalChannels)
+        {
+            KernalChannel channel = pair.Value;
+            writer.Write(pair.Key);
+            writer.Write(channel.Data.Length);
+            writer.Write(channel.Data);
+            writer.Write(channel.Position);
+            writer.Write(channel.Output.Count);
+
+            foreach (var value in channel.Output)
+                writer.Write(value);
+        }
+
+        lock (typeAheadLock)
+        {
+            writer.Write(typeAhead.Count);
+
+            foreach (var value in typeAhead)
+                writer.Write(value);
+        }
+    }
+
+    internal void ReadKernalState(BinaryReader reader)
+    {
+        CloseAllKernalChannels();
+
+        kernalInputChannel = reader.ReadInt32();
+        kernalOutputChannel = reader.ReadInt32();
+        int channelCount = reader.ReadInt32();
+
+        if (channelCount < 0 || channelCount > 256)
+            throw new InvalidDataException("Invalid channel count in state.");
+
+        for (var i = 0; i < channelCount; i++)
+        {
+            int logical = reader.ReadInt32();
+            int length = reader.ReadInt32();
+
+            if (length < 0 || length > 16_000_000)
+                throw new InvalidDataException("Invalid channel data in state.");
+
+            var data = reader.ReadBytes(length);
+
+            if (data.Length != length)
+                throw new EndOfStreamException();
+
+            KernalChannel channel = new(data)
+            {
+                Position = reader.ReadInt32()
+            };
+
+            int outputCount = reader.ReadInt32();
+
+            if (outputCount < 0 || outputCount > 16_000_000)
+                throw new InvalidDataException("Invalid channel output in state.");
+
+            for (var j = 0; j < outputCount; j++)
+                channel.Output.Add(reader.ReadByte());
+
+            kernalChannels[logical] = channel;
+        }
+
+        lock (typeAheadLock)
+        {
+            typeAhead.Clear();
+            int count = reader.ReadInt32();
+
+            if (count < 0 || count > 16_000_000)
+                throw new InvalidDataException("Invalid type-ahead state.");
+
+            for (var i = 0; i < count; i++)
+                typeAhead.Enqueue(reader.ReadByte());
+
+            Interlocked.Exchange(
+                ref typeAheadPending,
+                typeAhead.Count > 0 ? 1 : 0);
+        }
+    }
+
     private void Run()
     {
         var last = Stopwatch.GetTimestamp();
         var target = last + FrameTicks;
-        var frameCycles = 0;
 
         while (!stopRequested)
         {
             if (paused)
             {
+                Volatile.Write(
+                    ref pauseAcknowledgedGeneration,
+                    Volatile.Read(ref pauseGeneration));
+                pauseAcknowledged.Set();
                 pauseGate.Wait();
+                pauseAcknowledged.Reset();
                 last = Stopwatch.GetTimestamp();
                 target = last + FrameTicks;
                 continue;
@@ -1001,6 +1523,15 @@ internal sealed class C64Machine : IDisposable
             }
 
             frameCycles -= CyclesPerFrame;
+
+            if (
+                !IsWarping &&
+                rewindEnabled &&
+                ++rewindFrameCounter >= RewindIntervalFrames)
+            {
+                rewindFrameCounter = 0;
+                CaptureRewindSnapshot();
+            }
         }
 
         Volatile.Write(ref speedPercentage, 100);
@@ -1015,6 +1546,7 @@ internal sealed class C64Machine : IDisposable
 
         Cia1.ProcessTimers(1);
         Cia2.ProcessTimers(1);
+        Tape.Tick(1);
 
         // Warp only changes host pacing. Keep the VIC and SID running so
         // the display and audio remain live while the CPU runs faster.
