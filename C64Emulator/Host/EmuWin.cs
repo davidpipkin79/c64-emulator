@@ -813,7 +813,8 @@ internal sealed class EmuWin
                 [
                     (byte)key.Key,
                     (byte)(KeyboardMatrix.ShiftPressed(key) ? 1 : 0),
-                    (byte)(key.Down ? 1 : 0)
+                    (byte)(key.Down ? 1 : 0),
+                    (byte)(key.KeyboardCharacter.Length == 1 ? key.KeyboardCharacter[0] : 0)
                 ]);
             return;
         }

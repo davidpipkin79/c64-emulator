@@ -41,6 +41,82 @@ public sealed class InputTests : IDisposable
         Assert.Equal(expectedMask, mapped.ColumnMask);
     }
 
+    [Theory]
+    [InlineData('[', 5, 0x20, C64Shift.Pressed)]
+    [InlineData(']', 6, 0x04, C64Shift.Pressed)]
+    [InlineData('@', 5, 0x40, C64Shift.Released)]
+    [InlineData(':', 5, 0x20, C64Shift.Released)]
+    [InlineData(';', 6, 0x04, C64Shift.Released)]
+    [InlineData('\'', 3, 0x01, C64Shift.Pressed)]
+    [InlineData('+', 5, 0x01, C64Shift.Released)]
+    [InlineData('^', 6, 0x40, C64Shift.Released)]
+    [InlineData('\\', 6, 0x01, C64Shift.Released)]
+    public void TypedCharacter_SelectsC64KeyThatPrintsIt(
+        char character,
+        int expectedRow,
+        byte expectedMask,
+        C64Shift expectedShift)
+    {
+        KeyboardEventArgs args = new KeyboardEventArgs(Key.None, ModifierKeys.None, true);
+        args.KeyboardCharacter = character.ToString();
+
+        C64Key mapped = KeyboardMatrix.GetC64Key(args);
+
+        Assert.Equal(expectedRow, mapped.Row);
+        Assert.Equal(expectedMask, mapped.ColumnMask);
+        Assert.Equal(expectedShift, mapped.Shift);
+    }
+
+    [Fact]
+    public void PositionalMapping_UsesTheKeyInTheSamePlace()
+    {
+        KeyboardEventArgs args = new KeyboardEventArgs(Key.LeftBracket, ModifierKeys.None, true);
+        args.KeyboardCharacter = "[";
+
+        C64Key mapped = KeyboardMatrix.GetC64Key(args, characterBased: false);
+
+        Assert.Equal(5, mapped.Row);
+        Assert.Equal(0x40, mapped.ColumnMask);
+    }
+
+    [Fact]
+    public void TypedAtSign_ReleasesShiftSoTheC64PrintsAt()
+    {
+        Cia1 cia = system.Cia1!;
+        cia.Poke(0x02, 0xFF); // Port A drives the rows.
+
+        cia.KeyEvent(
+            new KeyboardEventArgs(Key.LeftShift, ModifierKeys.LeftShift, true),
+            false);
+
+        KeyboardEventArgs at = new KeyboardEventArgs(Key.Two, ModifierKeys.LeftShift, true);
+        at.KeyboardCharacter = "@";
+        cia.KeyEvent(at, false);
+
+        cia.Poke(0x00, 0xDF); // Select row 5, where '@' lives.
+        Assert.Equal(0xBF, cia.Peek(0x01));
+
+        cia.Poke(0x00, 0xFD); // Select row 1, where left shift lives.
+        Assert.Equal(0xFF, cia.Peek(0x01));
+    }
+
+    [Fact]
+    public void TypedQuote_PressesShiftSoTheC64PrintsQuote()
+    {
+        Cia1 cia = system.Cia1!;
+        cia.Poke(0x02, 0xFF);
+
+        KeyboardEventArgs quote = new KeyboardEventArgs(Key.Two, ModifierKeys.None, true);
+        quote.KeyboardCharacter = "\"";
+        cia.KeyEvent(quote, false);
+
+        cia.Poke(0x00, 0xFD); // Select row 1.
+        Assert.Equal(0x7F, cia.Peek(0x01));
+
+        cia.Poke(0x00, 0x7F); // Select row 7, where the 2" key lives.
+        Assert.Equal(0xF7, cia.Peek(0x01));
+    }
+
     [Fact]
     public void ShiftEquals_ProducesPlusKeyWithoutShiftState()
     {

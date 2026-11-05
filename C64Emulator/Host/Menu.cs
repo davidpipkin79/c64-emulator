@@ -385,6 +385,7 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                 "joy2map"));
         menuList.Add(new MenuList("Edit KeySet1", "editkey1"));
         menuList.Add(new MenuList("Edit KeySet2", "editkey2"));
+        menuList.Add(new MenuList(KeyboardMappingText(), "keyboard"));
     }
 
     private void LoadNetworkMenu()
@@ -959,6 +960,12 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                 menuList[2].Text = "Joystick 2 Map: " + machine.Cia1.Joy2Map;
                 break;
 
+            case "keyboard":
+            case "keyboard.left":
+            case "keyboard.right":
+                ToggleKeyboardMapping();
+                break;
+
             case "editkey1":
                 LoadKeySetMenu(1);
                 break;
@@ -1103,13 +1110,31 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
         }
     }
 
+    private static string KeyboardMappingText()
+    {
+        return
+            "Keyboard: " +
+            (AppSettings.Current.CharacterKeyboard ? "Character" : "Positional");
+    }
+
+    private void ToggleKeyboardMapping()
+    {
+        AppSettings.Current.CharacterKeyboard = !AppSettings.Current.CharacterKeyboard;
+        AppSettings.Current.Save();
+        UpdateItem("keyboard", KeyboardMappingText());
+        renderer.DisplayStatus(
+            AppSettings.Current.CharacterKeyboard
+                ? "Keyboard types characters"
+                : "Keyboard uses C64 key positions");
+    }
+
     /// <summary>
     /// Settings that answer Left and Right keep those keys instead of using
     /// them to step back out of the menu.
     /// </summary>
     private static bool ChangesWithLeftRight(string command)
     {
-        return command is "fps" or "vsync" or "audiodevice" or "volume" or "mute";
+        return command is "fps" or "vsync" or "audiodevice" or "volume" or "mute" or "keyboard";
     }
 
     private static string ResolveMediaDirectory()

@@ -54,6 +54,10 @@ internal sealed class Cia1 : Cia6526
     private readonly KeySet[] keyset;
     private readonly byte[] keyRows;
 
+    private bool shiftKeyDown;
+    private int shiftedCharacters;
+    private int plainCharacters;
+
     public Cia1(InterruptLine interrupts)
         : base(interrupts, InterruptSource.Cia1)
     {
@@ -188,6 +192,9 @@ internal sealed class Cia1 : Cia6526
     {
         base.Reset();
         Array.Fill(keyRows, (byte)0xFF);
+        shiftKeyDown = false;
+        shiftedCharacters = 0;
+        plainCharacters = 0;
         joyPort1Up = joyPort1Right = joyPort1Down = joyPort1Left = joyPort1Fire = false;
         joyPort2Up = joyPort2Right = joyPort2Down = joyPort2Left = joyPort2Fire = false;
     }
@@ -317,24 +324,18 @@ internal sealed class Cia1 : Cia6526
             }
         }
 
-        // Remote clients only send the shift state attached to each key,
-        // not separate shift-key events. Apply it here without disturbing
-        // locally-pressed shift keys.
-        if (skipMapCheck)
+        // The host shift keys only drive the C64 shift rows; they are not
+        // matrix keys of their own.
+        if (k.Key == Key.LeftShift || k.Key == Key.RightShift)
         {
-            if (KeyboardMatrix.ShiftPressed(k))
-            {
-                keyRows[1] &= 0x7F;
-                keyRows[6] &= 0xEF;
-            }
-            else
-            {
-                keyRows[1] |= 0x80;
-                keyRows[6] |= 0x10;
-            }
+            shiftKeyDown = k.Down;
+            ApplyShift();
+            return;
         }
 
-        C64Key key = KeyboardMatrix.GetC64Key(k);
+        C64Key key = KeyboardMatrix.GetC64Key(
+            k,
+            AppSettings.Current.CharacterKeyboard);
 
         if (key.ColumnMask == 0)
             return;
@@ -343,6 +344,49 @@ internal sealed class Cia1 : Cia6526
             keyRows[key.Row] &= (byte)(~key.ColumnMask);
         else
             keyRows[key.Row] |= key.ColumnMask;
+
+        switch (key.Shift)
+        {
+            case C64Shift.Pressed:
+                shiftedCharacters = Math.Max(0, shiftedCharacters + (k.Down ? 1 : -1));
+                break;
+
+            case C64Shift.Released:
+                plainCharacters = Math.Max(0, plainCharacters + (k.Down ? 1 : -1));
+                break;
+
+            case C64Shift.PassThrough:
+                // Remote clients send the shift state with each key instead
+                // of sending shift-key events of their own.
+                if (skipMapCheck)
+                    shiftKeyDown = KeyboardMatrix.ShiftPressed(k);
+
+                break;
+        }
+
+        ApplyShift();
+    }
+
+    /// <summary>
+    /// Sets the C64 shift rows for the character being typed. A character
+    /// that needs shift on the C64 keeps it pressed even when the host typed
+    /// it unshifted, and one that has a key of its own releases shift even
+    /// when the host needed it to type the character.
+    /// </summary>
+    private void ApplyShift()
+    {
+        var shift = shiftedCharacters > 0 || (shiftKeyDown && plainCharacters == 0);
+
+        if (shift)
+        {
+            keyRows[1] &= 0x7F;
+            keyRows[6] &= 0xEF;
+        }
+        else
+        {
+            keyRows[1] |= 0x80;
+            keyRows[6] |= 0x10;
+        }
     }
 
     public int Size => CiaSize;

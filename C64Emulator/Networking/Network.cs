@@ -186,11 +186,18 @@ internal sealed class Network
                 break;
 
             case NetworkCommand.KeyEvent when data.Length >= 3:
-                KeyEventReceived?.Invoke(
+                KeyboardEventArgs keyEvent =
                     new KeyboardEventArgs(
                         (Key)data[0],
                         data[1] != 0 ? ModifierKeys.LeftShift : ModifierKeys.None,
-                        data[2] == 1));
+                        data[2] == 1);
+
+                // The typed character is what selects the C64 key when the
+                // client sends it; older clients send only the key position.
+                if (data.Length >= 4 && data[3] != 0)
+                    keyEvent.KeyboardCharacter = ((char)data[3]).ToString();
+
+                KeyEventReceived?.Invoke(keyEvent);
                 break;
 
             case NetworkCommand.JoyEvent when data.Length >= 3:

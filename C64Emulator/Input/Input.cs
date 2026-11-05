@@ -194,7 +194,8 @@ internal static class KeyMapper
     /// <summary>
     /// Maps a physical SDL scancode to the emulator key. Scancodes are used
     /// instead of keycodes so shift and keyboard layout cannot change which
-    /// C64 matrix key is pressed.
+    /// C64 matrix key is pressed; the typed character takes precedence when
+    /// the key produces one.
     /// </summary>
     public static Key FromScancode(SDL.Scancode scancode)
     {
@@ -320,6 +321,10 @@ internal static class KeyMapper
         return result;
     }
 
+    /// <summary>
+    /// Returns the character the host keyboard layout types for this key, so
+    /// the C64 can be driven by character instead of by key position.
+    /// </summary>
     private static string GetCharacter(SDL.Keycode keycode, SDL.Keymod mod)
     {
         var code = (int)keycode;
@@ -327,12 +332,48 @@ internal static class KeyMapper
             (mod & SDL.Keymod.LShift) != 0 ||
             (mod & SDL.Keymod.RShift) != 0;
 
-        if (code >= 'a' && code <= 'z' && shift)
-            code -= 'a' - 'A';
+        if (code >= 'a' && code <= 'z')
+            return (shift ? char.ToUpperInvariant((char)code) : (char)code).ToString();
 
-        if (code >= 32 && code <= 126)
-            return ((char)code).ToString();
+        if (code >= 'A' && code <= 'Z')
+            return (shift ? (char)code : char.ToLowerInvariant((char)code)).ToString();
 
-        return string.Empty;
+        if (code < 32 || code > 126)
+            return string.Empty;
+
+        return (shift ? ShiftedCharacter((char)code) : (char)code).ToString();
+    }
+
+    /// <summary>
+    /// The character a key produces with Shift held on a US layout, which is
+    /// what the scancode table and Sdl Keycodes already assume.
+    /// </summary>
+    private static char ShiftedCharacter(char character)
+    {
+        return character switch
+        {
+            '`' => '~',
+            '1' => '!',
+            '2' => '@',
+            '3' => '#',
+            '4' => '$',
+            '5' => '%',
+            '6' => '^',
+            '7' => '&',
+            '8' => '*',
+            '9' => '(',
+            '0' => ')',
+            '-' => '_',
+            '=' => '+',
+            '[' => '{',
+            ']' => '}',
+            '\\' => '|',
+            ';' => ':',
+            '\'' => '"',
+            ',' => '<',
+            '.' => '>',
+            '/' => '?',
+            _ => character
+        };
     }
 }

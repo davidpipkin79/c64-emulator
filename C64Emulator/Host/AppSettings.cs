@@ -42,6 +42,12 @@ internal sealed class AppSettings
     /// </summary>
     public bool VSync { get; set; } = true;
 
+    /// <summary>
+    /// Map host keys to the C64 key that prints the typed character (the
+    /// default) instead of the C64 key that sits in the same place.
+    /// </summary>
+    public bool CharacterKeyboard { get; set; } = true;
+
     public int Joystick1Map { get; set; } = 3;
 
     public int Joystick2Map { get; set; }
