@@ -1,52 +1,56 @@
 using System;
+using C64Emulator.Audio;
+using C64Emulator.Core;
+using C64Emulator.Cpu;
+using C64Emulator.Devices;
+using C64Emulator.Video;
 
-namespace C64Emulator.Tests
+namespace C64Emulator.Tests;
+
+internal sealed class TestSystem : IDisposable
 {
-    internal sealed class TestSystem : IDisposable
+    public TestSystem(bool withPeripherals = false, RomSet? roms = null)
     {
-        public TestSystem(bool withPeripherals = false, RomSet? roms = null)
-        {
-            Memory = new Memory();
-            Interrupts = new InterruptLine();
-            Cpu = new CPU6510(Memory, Interrupts);
+        Memory = new Memory();
+        Interrupts = new InterruptLine();
+        Cpu = new Cpu6510(Memory, Interrupts);
 
-            if (!withPeripherals)
-                return;
+        if (!withPeripherals)
+            return;
 
-            ColorRam = new ColorRam();
-            Vic = new VIC(Memory, ColorRam, Interrupts);
-            Sid = new SID();
-            Cia1 = new CIA1(Interrupts);
-            Cia2 = new CIA2(Interrupts, Vic);
-            Io = new IO(Vic, Sid, ColorRam, Cia1, Cia2);
-            Memory.Configure(
-                roms ?? RomSet.Create(
-                    new byte[AddressMap.KernalRomSize],
-                    new byte[AddressMap.BasicRomSize],
-                    new byte[AddressMap.CharacterRomSize]),
-                Io);
-        }
+        ColorRam = new ColorRam();
+        Vic = new Vic(Memory, ColorRam, Interrupts);
+        Sid = new Sid();
+        Cia1 = new Cia1(Interrupts);
+        Cia2 = new Cia2(Interrupts, Vic);
+        Io = new IoController(Vic, Sid, ColorRam, Cia1, Cia2);
+        Memory.Configure(
+            roms ?? RomSet.Create(
+                new byte[AddressMap.KernalRomSize],
+                new byte[AddressMap.BasicRomSize],
+                new byte[AddressMap.CharacterRomSize]),
+            Io);
+    }
 
-        public Memory Memory { get; }
+    public Memory Memory { get; }
 
-        public InterruptLine Interrupts { get; }
+    public InterruptLine Interrupts { get; }
 
-        public CPU6510 Cpu { get; }
+    public Cpu6510 Cpu { get; }
 
-        public ColorRam? ColorRam { get; }
+    public ColorRam? ColorRam { get; }
 
-        public VIC? Vic { get; }
+    public Vic? Vic { get; }
 
-        public SID? Sid { get; }
+    public Sid? Sid { get; }
 
-        public CIA1? Cia1 { get; }
+    public Cia1? Cia1 { get; }
 
-        public CIA2? Cia2 { get; }
+    public Cia2? Cia2 { get; }
 
-        public IO? Io { get; }
+    public IoController? Io { get; }
 
-        public void Dispose()
-        {
-        }
+    public void Dispose()
+    {
     }
 }

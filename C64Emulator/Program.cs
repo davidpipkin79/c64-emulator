@@ -1,16 +1,16 @@
 using System;
+using C64Emulator.Host;
 
-namespace C64Emulator
+namespace C64Emulator;
+
+internal static class Program
 {
-    internal static class Program
+    /// <summary>
+    /// The main entry point for the application.
+    /// </summary>
+    [STAThread]
+    private static void Main()
     {
-        /// <summary>
-        /// The main entry point for the application.
-        /// </summary>
-        [STAThread]
-        private static void Main()
-        {
-            new EmuWin().Start();
-        }
+        new EmuWin().Start();
     }
 }

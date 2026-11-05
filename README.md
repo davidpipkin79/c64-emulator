@@ -122,38 +122,56 @@ directory stream.) Programs that install their own fastloader or bit-bang the
 it is experimental and not required for normal D64 loading. GCR-level
 protection, custom disk formats, tape pulses and error maps are not modeled.
 
+## Project layout
+
+The emulator project is split by feature, with one namespace per folder.
+
+| Folder | Namespace | Contents |
+| --- | --- | --- |
+| `Core/` | `C64Emulator.Core` | `C64Machine` composition root, memory/PLA, address map, color RAM, ROM images and interrupt line |
+| `Cpu/` | `C64Emulator.Cpu` | 6510 core and the cycle-clocked CPU bus |
+| `Video/` | `C64Emulator.Video` | VIC-II renderer, C64 palette and colour type |
+| `Audio/` | `C64Emulator.Audio` | SID synthesis and the optional sound trace |
+| `Devices/` | `C64Emulator.Devices` | CIAs, VIA, keyboard matrix, IEC bus, 1541 hardware, disk/tape devices and cartridges |
+| `Media/` | `C64Emulator.Media` | D64/T64 image parsing, GCR codec, PETSCII helpers and filename matching |
+| `Host/` | `C64Emulator.Host` | SDL window, renderer, menu, audio output and persisted settings |
+| `Input/` | `C64Emulator.Input` | SDL key mapping types shared by the host and the CIAs |
+| `Networking/` | `C64Emulator.Networking` | host/client protocol and framed TCP transport |
+
+`Program.cs` stays at the project root and only starts the SDL host.
+
 ## Architecture
 
 ```
 Program
   └─ EmuWin (SDL host, input, audio, networking, menu)
        ├─ Renderer (SDL textures, overlays, FPS)
-       ├─ AudioOutput (selectable SDL playback device, SID sample queue -> audio stream)
-       ├─ Network / Socket (host/client image + input transport)
+       ├─ AudioOutput (selectable SDL playback device, Sid sample queue -> audio stream)
+       ├─ Network / NetworkTransport (host/client image + input transport)
        └─ C64Machine (composition root + PAL clock)
-            ├─ CPU6510  ── IMemoryBus
+            ├─ Cpu6510  ── IMemoryBus
             ├─ Memory   ── PLA, RAM, ROM overlays, I/O decode
-            ├─ VIC      ── IVideoBus, ColorRam, InterruptLine
-            ├─ CIA1 / CIA2 ── timers, TOD, ports, keyboard/joystick lines
-            ├─ SID      ── 3 voices, ADSR, ring/sync, resonant filter, 48 kHz mono queue
-            ├─ C1541Drive ── D64 directory, file chains and KERNAL LOAD bridge
+            ├─ Vic      ── IVideoBus, ColorRam, InterruptLine
+            ├─ Cia1 / Cia2 ── timers, TOD, ports, keyboard/joystick lines
+            ├─ Sid      ── 3 voices, ADSR, ring/sync, resonant filter, 48 kHz mono queue
+            ├─ DiskDrive ── D64 directory, file chains and KERNAL LOAD bridge
             ├─ TapeDrive ── T64 directory, program payloads and KERNAL LOAD bridge
             ├─ Cartridge ── standard 8K/16K CRT image and ROML/ROMH overlay
-            └─ IO       ── $D000-$DFFF chip mirrors
+            └─ IoController ── $D000-$DFFF chip mirrors
 ```
 
 Important boundaries:
 
-- `CPU6510.Step()` executes exactly one instruction and returns its cycle
+- `Cpu6510.Step()` executes exactly one instruction and returns its cycle
   count. It does not own a thread, wall-clock pacing, or device tick calls.
 - `C64Machine` owns the emulation thread and advances CIA timers, the SID and
   the VIC by the cycles the CPU consumed.
 - `InterruptLine` is a wired-OR of VIC/CIA IRQ sources. Devices assert and
   release their source; the CPU samples the line at instruction boundaries.
-- `VIC` renders into a back buffer and swaps it into the front buffer at the end
+- `Vic` renders into a back buffer and swaps it into the front buffer at the end
   of a frame. `Renderer` copies the front buffer on the main thread, so SDL is
   never called from the emulation thread.
-- `SID` synthesis runs on the emulation thread and only appends to a bounded
+- `Sid` synthesis runs on the emulation thread and only appends to a bounded
   sample queue. `AudioOutput` drains that queue and calls SDL on the host thread.
 - `Memory` keeps RAM underneath the ROM/I/O overlays. Writes while a ROM is
   banked in go to RAM; the PLA's LORAM/HIRAM/CHAREN bits are decoded exactly
