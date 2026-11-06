@@ -75,6 +75,7 @@ internal sealed class EmuWin
             machine.VideoStandard = AppSettings.Current.VideoStandard;
             machine.Sid.OutputVolume = AppSettings.Current.AudioVolume;
             machine.Sid.Muted = AppSettings.Current.AudioMuted;
+            machine.Sid.Model = AppSettings.Current.SidChipModel;
             renderer = new Renderer(machine);
 
             AudioOutput audioOutput = new AudioOutput(AppSettings.Current.AudioDevice);

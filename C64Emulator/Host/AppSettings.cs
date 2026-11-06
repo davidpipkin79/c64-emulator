@@ -3,6 +3,7 @@ using System.IO;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
+using C64Emulator.Audio;
 using C64Emulator.Core;
 using C64Emulator.Input;
 using C64Emulator.Video;
@@ -21,9 +22,11 @@ internal sealed class AppSettings
         "settings.json"
         );
 
-    private static readonly JsonSerializerOptions SerializerOptions = CreateOptions();        private static readonly Lock SyncRoot = new();
+    private static readonly JsonSerializerOptions SerializerOptions = CreateOptions();
 
-    public static AppSettings Current { get; } = Load();
+    private static readonly Lock SyncRoot = new();
+
+    public static AppSettings Current { get; } = LoadFrom(SettingsFile);
 
     public bool Fullscreen { get; set; }
 
@@ -132,6 +135,12 @@ internal sealed class AppSettings
     /// </summary>
     public string AudioDevice { get; set; } = string.Empty;
 
+    /// <summary>
+    /// SID revision. The breadbin 6581 is the default; the 8580 in later
+    /// C64C boards has a brighter, linear filter.
+    /// </summary>
+    public SidModel SidChipModel { get; set; } = SidModel.Mos6581;
+
     private static JsonSerializerOptions CreateOptions()
     {
         JsonSerializerOptions options = new JsonSerializerOptions
@@ -144,14 +153,14 @@ internal sealed class AppSettings
         return options;
     }
 
-    private static AppSettings Load()
+    internal static AppSettings LoadFrom(string settingsFile)
     {
         try
         {
-            if (File.Exists(SettingsFile))
+            if (File.Exists(settingsFile))
             {
                 AppSettings? settings = JsonSerializer.Deserialize<AppSettings>(
-                    File.ReadAllText(SettingsFile),
+                    File.ReadAllText(settingsFile),
                     SerializerOptions
                     );
 
@@ -192,26 +201,37 @@ internal sealed class AppSettings
         AudioVolume = Math.Clamp(AudioVolume, 0, 100);
         AudioDevice = AudioDevice ?? string.Empty;
 
+        if (!Enum.IsDefined(typeof(SidModel), SidChipModel))
+            SidChipModel = SidModel.Mos6581;
+
         if (!Enum.IsDefined(typeof(C64Emulator.Video.VideoStandard), VideoStandard))
             VideoStandard = C64Emulator.Video.VideoStandard.Pal;
     }
 
     public void Save()
     {
+        SaveTo(SettingsFile);
+    }
+
+    internal void SaveTo(string settingsFile)
+    {
         lock (SyncRoot)
         {
             try
             {
-                Directory.CreateDirectory(SettingsDirectory);
+                var directory = Path.GetDirectoryName(settingsFile);
 
-                var temporaryFile = SettingsFile + ".tmp";
+                if (!string.IsNullOrEmpty(directory))
+                    Directory.CreateDirectory(directory);
+
+                var temporaryFile = settingsFile + ".tmp";
 
                 File.WriteAllText(
                     temporaryFile,
                     JsonSerializer.Serialize(this, SerializerOptions)
                     );
 
-                File.Move(temporaryFile, SettingsFile, true);
+                File.Move(temporaryFile, settingsFile, true);
             }
             catch
             {

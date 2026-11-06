@@ -25,6 +25,58 @@ internal sealed class MenuList(string text, string command, string[]? args = nul
 }
 
 /// <summary>
+/// Builds the explicit PAL/NTSC choices for the Display menu and resolves
+/// their command arguments. Keeping this separate from the SDL menu makes
+/// the labels and selection values testable without opening a window.
+/// </summary>
+internal static class VideoStandardMenu
+{
+    public const string Command = "videostandard";
+
+    public static (string Argument, string Text)[] Choices(
+        VideoStandard active)
+    {
+        return
+        [
+            ("pal", OptionText(VideoStandard.Pal, active)),
+            ("ntsc", OptionText(VideoStandard.Ntsc, active))
+        ];
+    }
+
+    public static bool TryParse(
+        string? argument,
+        out VideoStandard standard)
+    {
+        if (string.Equals(argument, "pal", StringComparison.OrdinalIgnoreCase))
+        {
+            standard = VideoStandard.Pal;
+            return true;
+        }
+
+        if (string.Equals(argument, "ntsc", StringComparison.OrdinalIgnoreCase))
+        {
+            standard = VideoStandard.Ntsc;
+            return true;
+        }
+
+        standard = VideoStandard.Pal;
+        return false;
+    }
+
+    private static string OptionText(
+        VideoStandard standard,
+        VideoStandard active)
+    {
+        var marker = standard == active ? "[X]" : "[ ]";
+        var name = standard == VideoStandard.Ntsc
+            ? "NTSC (60 Hz)"
+            : "PAL (50 Hz)";
+
+        return $"Video Standard: {marker} {name}";
+    }
+}
+
+/// <summary>
 /// In-emulator menu. It is intentionally a plain state machine over the
 /// renderer's text overlay rather than a second UI toolkit.
 /// </summary>
@@ -356,10 +408,14 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
             new MenuList(
                 "VSync: " + (renderer.VSyncEnabled ? "Yes" : "No"),
                 "vsync"));
-        menuList.Add(
-            new MenuList(
-                VideoStandardText(machine.VideoStandard),
-                "videostandard"));
+        foreach (var choice in VideoStandardMenu.Choices(machine.VideoStandard))
+        {
+            menuList.Add(
+                new MenuList(
+                    choice.Text,
+                    VideoStandardMenu.Command,
+                    [choice.Argument]));
+        }
         menuList.Add(
             new MenuList(
                 "Scanlines: " + (renderer.Scanlines ? "On" : "Off"),
@@ -478,6 +534,10 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
             new MenuList(
                 "Mute: " + (AppSettings.Current.AudioMuted ? "Yes" : "No"),
                 "mute"));
+        menuList.Add(
+            new MenuList(
+                "SID: " + SidModelText(),
+                "sidmodel"));
     }
 
     private void LoadInputMenu()
@@ -980,10 +1040,13 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                 }
                 break;
 
-            case "videostandard":
-            case "videostandard.left":
-            case "videostandard.right":
-                ToggleVideoStandard();
+            case VideoStandardMenu.Command:
+                if (
+                    args.Length > 0 &&
+                    VideoStandardMenu.TryParse(args[0], out var standard))
+                {
+                    SelectVideoStandard(standard);
+                }
                 break;
 
             case "scanlines":
@@ -1036,6 +1099,12 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
             case "mute.left":
             case "mute.right":
                 ToggleMute();
+                break;
+
+            case "sidmodel":
+            case "sidmodel.left":
+            case "sidmodel.right":
+                ToggleSidModel();
                 break;
 
             case "starthost":
@@ -1164,45 +1233,11 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
     /// </summary>
     private void LaunchFile(string path)
     {
-        var name = Path.GetFileName(path);
-
         try
         {
-            switch (Path.GetExtension(path).ToLowerInvariant())
-            {
-                case ".prg":
-                    machine.LoadProgram(path);
-                    MenuReturn?.Invoke();
-                    renderer.DisplayStatus("Loaded " + name);
-                    break;
-
-                case ".d64":
-                    machine.MountDisk(path);
-                    MenuReturn?.Invoke();
-                    machine.TypeText("LOAD\"*\",8,1\rRUN\r");
-                    renderer.DisplayStatus("Mounted " + name + ": LOAD\"*\",8,1");
-                    break;
-
-                case ".t64":
-                    machine.MountTape(path);
-                    MenuReturn?.Invoke();
-                    machine.TypeText("LOAD\"*\",1,1\rRUN\r");
-                    renderer.DisplayStatus("Mounted " + name + ": LOAD\"*\",1,1");
-                    break;
-
-                case ".tap":
-                    machine.MountTape(path);
-                    MenuReturn?.Invoke();
-                    machine.TypeText("LOAD\"\",1,1\rRUN\r");
-                    renderer.DisplayStatus("Mounted " + name + ": LOAD\"\",1,1");
-                    break;
-
-                case ".crt":
-                    machine.MountCartridge(path);
-                    MenuReturn?.Invoke();
-                    renderer.DisplayStatus("Mounted cartridge " + name);
-                    break;
-            }
+            var status = machine.AutoStart(path);
+            MenuReturn?.Invoke();
+            renderer.DisplayStatus(status);
         }
         catch (Exception ex)
         {
@@ -1265,24 +1300,22 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
     }
 
     /// <summary>
-    /// Switches between PAL and NTSC. The machine resets so the KERNAL can
-    /// redetect the frame rate at $02A6, and the renderer rebuilds its frame
-    /// texture for the new picture height.
+    /// Selects PAL or NTSC. The machine resets so the KERNAL can redetect the
+    /// frame rate at $02A6, and the renderer rebuilds its frame texture for
+    /// the new picture height.
     /// </summary>
-    private void ToggleVideoStandard()
+    private void SelectVideoStandard(VideoStandard standard)
     {
-        VideoStandard next = machine.VideoStandard == VideoStandard.Pal
-            ? VideoStandard.Ntsc
-            : VideoStandard.Pal;
+        if (machine.VideoStandard != standard)
+        {
+            machine.VideoStandard = standard;
+            AppSettings.Current.VideoStandard = standard;
+            renderer.ApplyVideoStandard();
+            AppSettings.Current.Save();
+        }
 
-        machine.VideoStandard = next;
-        AppSettings.Current.VideoStandard = next;
-        renderer.ApplyVideoStandard();
-        AppSettings.Current.Save();
-
-        // Rebuild the display menu so the window presets and the fullscreen
-        // modes follow the new frame size and refresh rate, keeping the
-        // highlight on the video-standard item.
+        // Rebuild the display menu so the active marker, window presets and
+        // fullscreen modes follow the new frame size and refresh rate.
         var index = selectedItem;
 
         LoadDisplayMenu();
@@ -1293,7 +1326,7 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
             Math.Max(0, menuList.Count - MaxItems));
 
         renderer.DisplayStatus(
-            next == VideoStandard.Ntsc
+            standard == VideoStandard.Ntsc
                 ? "NTSC timing: 1022727 Hz, 59.83 Hz frames"
                 : "PAL timing: 985248 Hz, 50.13 Hz frames");
     }
@@ -1326,13 +1359,6 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                 : "Fullscreen fits the whole picture");
     }
 
-    private static string VideoStandardText(VideoStandard standard)
-    {
-        return standard == VideoStandard.Ntsc
-            ? "Video Standard: NTSC (60 Hz)"
-            : "Video Standard: PAL (50 Hz)";
-    }
-
     /// <summary>
     /// Settings that answer Left and Right keep those keys instead of using
     /// them to step back out of the menu.
@@ -1342,11 +1368,11 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
         return command is
             "fps" or
             "vsync" or
-            "videostandard" or
             "scanlines" or
             "fullscreenfill" or
             "audiodevice" or
             "volume" or
+            "sidmodel" or
             "mute" or
             "keyboard";
     }
@@ -1406,6 +1432,29 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
         AppSettings.Current.Save();
 
         menuList[3].Text = "Mute: " + (muted ? "Yes" : "No");
+    }
+
+    private void ToggleSidModel()
+    {
+        SidModel next = machine.Sid.Model == SidModel.Mos6581
+            ? SidModel.Mos8580
+            : SidModel.Mos6581;
+
+        machine.Sid.Model = next;
+        AppSettings.Current.SidChipModel = next;
+        AppSettings.Current.Save();
+        UpdateItem("sidmodel", "SID: " + SidModelText());
+        renderer.DisplayStatus(
+            next == SidModel.Mos8580
+                ? "SID 8580: linear filter, brighter cutoff"
+                : "SID 6581: saturating filter, lower cutoff");
+    }
+
+    private static string SidModelText()
+    {
+        return AppSettings.Current.SidChipModel == SidModel.Mos8580
+            ? "8580 (C64C)"
+            : "6581 (breadbin)";
     }
 
     private void SelectNextAudioDevice(int direction)

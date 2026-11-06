@@ -165,6 +165,64 @@ public sealed class SidTests
         Assert.InRange(sid.GetRegister(0x1C), 245, 255);
     }
 
+    [Fact]
+    public void EnvelopeAttack_UsesTheHardwareRateCounterPeriods()
+    {
+        Sid sid = new Sid();
+        sid.SetRegister(0x13, 0x00); // Attack 0: one step per 9 cycles.
+        sid.SetRegister(0x14, 0xF0); // Sustain 15.
+        sid.SetRegister(0x12, 0x01); // Gate on (voice 3; $D41C reads it).
+
+        sid.Clock(900);
+
+        Assert.InRange(sid.GetRegister(0x1C), 98, 102);
+
+        sid.Clock(1500); // Past 255 * 9 cycles.
+
+        Assert.Equal(0xFF, sid.GetRegister(0x1C));
+    }
+
+    [Fact]
+    public void EnvelopeRelease_FollowsTheExponentialDivider()
+    {
+        Sid sid = new Sid();
+        sid.SetRegister(0x13, 0x00);
+        sid.SetRegister(0x14, 0xF0); // Sustain 15, release 0.
+        sid.SetRegister(0x12, 0x01);
+
+        sid.Clock(3000);
+        Assert.Equal(0xFF, sid.GetRegister(0x1C));
+
+        sid.SetRegister(0x12, 0x20); // Gate off.
+
+        // A linear 255-step ramp would be finished after 2295 cycles. The
+        // real envelope divides through the exponential counter, so it is
+        // still well above zero here and reaches zero at about 6.8 ms.
+        sid.Clock(3000);
+        Assert.InRange(sid.GetRegister(0x1C), 25, 40);
+
+        sid.Clock(5000);
+        Assert.Equal(0, sid.GetRegister(0x1C));
+    }
+
+    [Fact]
+    public void SwitchingModel_KeepsTheRegisterAndEnvelopeState()
+    {
+        Sid sid = new Sid();
+        sid.SetRegister(0x13, 0x00);
+        sid.SetRegister(0x14, 0xF0);
+        sid.SetRegister(0x12, 0x01);
+        sid.Clock(1500);
+
+        var envelope = sid.GetRegister(0x1C);
+
+        sid.Model = SidModel.Mos8580;
+
+        Assert.Equal(SidModel.Mos8580, sid.Model);
+        Assert.Equal(envelope, sid.GetRegister(0x1C));
+        Assert.Equal(0x01, sid.GetRegister(0x12));
+    }
+
     private static void ConfigureSawVoice(Sid sid)
     {
         sid.SetRegister(0x00, 0x00);

@@ -21,6 +21,11 @@ internal abstract class Cia6526
 
     [System.NonSerialized]
     private int todClockCycles = DefaultTodClockCycles;
+
+    // Tenths of a second since midnight that a reset starts the TOD at.
+    // Kept out of save states: the live TOD fields below are the state.
+    [System.NonSerialized]
+    private int todStartTenths;
     private int todTenths;
     private int todSeconds;
     private int todMinutes;
@@ -69,7 +74,7 @@ internal abstract class Cia6526
         this.interrupts = interrupts ?? throw new ArgumentNullException(nameof(interrupts));
         this.interruptSource = interruptSource;
         this.useNmi = useNmi;
-        ResetTodToNow();
+        ResetTodToSeed();
     }
 
     protected byte PortAOutput { get; set; }
@@ -93,6 +98,18 @@ internal abstract class Cia6526
     {
         get => todClockCycles;
         set => todClockCycles = Math.Max(1, value / 10);
+    }
+
+    /// <summary>
+    /// Starts the time-of-day clock at a chosen time, expressed in tenths of
+    /// a second since midnight. A fresh machine starts at 00:00:00.0 so runs
+    /// and save states are reproducible; a host that wants wall-clock time
+    /// can pass <c>(int)(DateTime.Now.TimeOfDay.TotalSeconds * 10)</c>.
+    /// </summary>
+    public void SeedTod(int tenthsOfDay)
+    {
+        todStartTenths = Math.Clamp(tenthsOfDay, 0, 863_999);
+        ResetTodToSeed();
     }
 
     public virtual void Reset()
@@ -531,19 +548,24 @@ internal abstract class Cia6526
             todHours = 1;
     }
 
-    private void ResetTodToNow()
+    private void ResetTodToSeed()
     {
-        DateTime now = DateTime.Now;
+        var remaining = todStartTenths;
 
-        todTenths = now.Millisecond / 100;
-        todSeconds = now.Second;
-        todMinutes = now.Minute;
-        todHours = now.Hour % 12;
+        todTenths = remaining % 10;
+        remaining /= 10;
+        todSeconds = remaining % 60;
+        remaining /= 60;
+        todMinutes = remaining % 60;
+
+        var hours24 = remaining / 60;
+
+        todPm = hours24 >= 12;
+        todHours = hours24 % 12;
 
         if (todHours == 0)
             todHours = 12;
 
-        todPm = now.Hour >= 12;
         todCycles = 0;
         todHalted = false;
         todLatched = false;

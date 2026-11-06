@@ -277,6 +277,73 @@ public sealed class CpuTests : IDisposable
         Assert.Equal(5, cycles);
     }
 
+    [Fact]
+    public void Cli_DelaysIrqRecognitionByOneInstruction()
+    {
+        cpu.P = 0x24; // I set
+        cpu.SetPC(0x0200);
+        write(0x0200, 0x58); // CLI
+        write(0x0201, 0xEA); // NOP
+        write(0x0202, 0xEA); // NOP
+        write(0xFFFE, 0x00);
+        write(0xFFFF, 0x03);
+
+        system.Interrupts.Set(InterruptSource.Cia1, true);
+
+        Assert.Equal(2, cpu.Step()); // CLI
+        Assert.Equal(0x0201, cpu.GetPC());
+
+        // The line was polled before CLI's I-flag update landed, so one
+        // instruction still runs before the vector is taken.
+        Assert.Equal(2, cpu.Step()); // NOP
+        Assert.Equal(0x0202, cpu.GetPC());
+
+        Assert.Equal(7, cpu.Step()); // IRQ
+        Assert.Equal(0x0300, cpu.GetPC());
+    }
+
+    [Fact]
+    public void Irq_IsTakenBeforeSeiExecutes()
+    {
+        cpu.P = 0x20;
+        cpu.SetPC(0x0200);
+        write(0x0200, 0x78); // SEI
+        write(0xFFFE, 0x00);
+        write(0xFFFF, 0x03);
+
+        system.Interrupts.Set(InterruptSource.Cia1, true);
+
+        Assert.Equal(7, cpu.Step());
+        Assert.Equal(0x0300, cpu.GetPC());
+        Assert.True((cpu.P & 0x04) != 0);
+    }
+
+    [Fact]
+    public void NmiEdge_IsServicedOncePerTransition()
+    {
+        cpu.SetPC(0x0200);
+        write(0x0200, 0xEA);
+        write(0x0300, 0xEA);
+        write(0xFFFA, 0x00);
+        write(0xFFFB, 0x03);
+
+        system.Interrupts.SetNmi(InterruptSource.Cia2, true);
+
+        Assert.Equal(7, cpu.Step());
+        Assert.Equal(0x0300, cpu.GetPC());
+
+        // The line is still asserted. A level-sensitive NMI would fire
+        // again rather than executing the instruction at the handler.
+        Assert.Equal(2, cpu.Step());
+        Assert.Equal(0x0301, cpu.GetPC());
+
+        system.Interrupts.SetNmi(InterruptSource.Cia2, false);
+        system.Interrupts.SetNmi(InterruptSource.Cia2, true);
+
+        Assert.Equal(7, cpu.Step());
+        Assert.Equal(0x0300, cpu.GetPC());
+    }
+
     private int run(params byte[] code)
     {
         const ushort start = 0x0200;

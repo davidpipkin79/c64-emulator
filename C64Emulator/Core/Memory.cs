@@ -13,6 +13,7 @@ namespace C64Emulator.Core;
 internal sealed class Memory : IMemoryBus, IVideoBus
 {
     private readonly byte[] ram = new byte[AddressMap.RamSize];
+    private readonly BusLatch busLatch;
 
     private RomSet? roms;
     private IIoPort? io;
@@ -39,8 +40,9 @@ internal sealed class Memory : IMemoryBus, IVideoBus
     /// </summary>
     internal Action<byte>? ProcessorPortWritten { get; set; }
 
-    public Memory()
+    public Memory(BusLatch? dataBus = null)
     {
+        busLatch = dataBus ?? new BusLatch();
         ResetProcessorPort();
     }
 
@@ -85,6 +87,9 @@ internal sealed class Memory : IMemoryBus, IVideoBus
 
     public void Poke(ushort address, byte value)
     {
+        // A write leaves its value on the data bus just like a read does.
+        busLatch.Value = value;
+
         // Diagnostic only: record who writes the music engine's state,
         // including the zero-page note queue at $20-$29, so a trace shows
         // whether the game ever asks for a note.
@@ -113,6 +118,13 @@ internal sealed class Memory : IMemoryBus, IVideoBus
     }
 
     public byte Peek(ushort address)
+    {
+        var value = PeekCore(address);
+        busLatch.Value = value;
+        return value;
+    }
+
+    private byte PeekCore(ushort address)
     {
         if (address == AddressMap.ProcessorPort)
         {
@@ -161,6 +173,15 @@ internal sealed class Memory : IMemoryBus, IVideoBus
         return ram[address];
     }
 
+    /// <summary>
+    /// Reads a byte for host diagnostics without disturbing the open-bus
+    /// latch. Emulation reads must use <see cref="Peek"/>.
+    /// </summary>
+    public byte Inspect(ushort address)
+    {
+        return PeekCore(address);
+    }
+
     public ushort PeekWord(ushort address)
     {
         return (ushort)(Peek(address) | (Peek((ushort)(address + 1)) << 8));
@@ -176,6 +197,15 @@ internal sealed class Memory : IMemoryBus, IVideoBus
     /// $9000-$9FFF. It does not see the KERNAL/BASIC ROMs or I/O.
     /// </summary>
     public byte Read(ushort address)
+    {
+        // VIC fetches drive the bus too, so a CPU read from an unmapped
+        // address sees the byte the video chip last fetched.
+        var value = ReadCore(address);
+        busLatch.Value = value;
+        return value;
+    }
+
+    private byte ReadCore(ushort address)
     {
         if (roms is not null)
         {

@@ -81,8 +81,10 @@ settings file as the display, input and network preferences, so they survive a
 restart. Device selection uses the SDL playback-device list and falls back to
 the system default if the saved device is no longer present.
 
-The **Display** menu has persisted VSync and scanline toggles and a
-**Video Standard** entry that switches between PAL (the default) and NTSC.
+The **Display** menu has persisted VSync and scanline toggles and explicit
+**PAL (50 Hz)** and **NTSC (60 Hz)** video standard choices. PAL is the
+default; the active standard is marked `[X]`, and selecting the other choice
+resets the machine and switches timing immediately.
 Scanlines are off by default and only affect the host presentation; they do
 not change the VIC frame, save states, screenshots or network frames. Menus
 longer than the visible rows show a proportional scrollbar inside the right
@@ -232,6 +234,9 @@ Important boundaries:
   the VIC by the cycles the CPU consumed.
 - `InterruptLine` is a wired-OR of VIC/CIA IRQ sources. Devices assert and
   release their source; the CPU samples the line at instruction boundaries.
+  `CLI`/`SEI`/`PLP`/`RTI` delay IRQ recognition by one instruction, because the
+  flag update lands after the 6502 has polled the line. NMI is edge-triggered
+  and latches one edge until the CPU services it.
 - `Vic` renders into a back buffer and swaps it into the front buffer at the end
   of a frame. `Renderer` copies the front buffer on the main thread, so SDL is
   never called from the emulation thread.
@@ -247,6 +252,9 @@ Important boundaries:
   mode with NMOS flag behavior, page-crossing/pointer-wrap timing, NMI/IRQ and
   JAM handling.
 - 64 KB memory map with KERNAL/BASIC/character ROM overlays and I/O mirroring.
+  Addresses that no chip decodes return the last value driven on the data bus
+  (open bus), including the $DE00-$DFFF cartridge windows, which can be handed
+  to an expansion-port device.
 - VIC-II text, multicolor text, extended-color text, standard bitmap and
   multicolor bitmap modes; sprites (including expansion, priority and
   collisions), raster compare/IRQ, border/background colors, X/Y hardware
@@ -261,11 +269,14 @@ Important boundaries:
   The PAL raster counter uses the 62/63/64-cycle line pattern, while NTSC uses
   65-cycle lines throughout; both raise raster IRQs on cycle 1 of the matching
   line and report the previous line at cycle 0 of line 0.
-- Two 6526 CIA timers, ICR behavior, TOD clock (BCD and latching), keyboard
+- Two 6526 CIA timers, ICR behavior, TOD clock (BCD and latching; seeded at
+  midnight for reproducible runs, with `SeedTod` for wall-clock use), keyboard
   matrix and both joystick ports.
 - SID audio: three 24-bit oscillator voices with triangle, sawtooth, pulse,
-  noise and combined waveforms; ADSR envelopes; ring modulation and sync;
-  shared resonant low/band/high-pass filter; 48 kHz mono SDL audio output
+  noise and combined waveforms; cycle-clocked ADSR envelopes with the chip's
+  rate-counter and exponential-divider timing; ring modulation and sync;
+  shared resonant low/band/high-pass filter with selectable 6581 (saturating,
+  low cutoff) and 8580 (linear, brighter) models; 48 kHz mono SDL audio output
   with a persisted master volume and mute setting.
 - Virtual 1541 drive for standard D64 images: directory parsing, PRG file
   chains, mount/eject, direct PRG launch, KERNAL `LOAD`/`OPEN` channel support
@@ -290,13 +301,154 @@ its bounded sample queue is drained on the SDL host thread. Audio continues
 during warp and is muted only while a network client is displaying the host
 screen.
 
+## Command line
+
+With no arguments the emulator opens its window as before. Any arguments
+select a synchronous headless run, which is useful for scripts and accuracy
+checks:
+
+```bash
+C64Emulator --help
+C64Emulator --headless --cycles 20000000
+C64Emulator game.d64 --cycles 20000000
+C64Emulator program.prg --cycles 500000
+C64Emulator --headless --cycles 3000000 --screenshot ready.bmp
+C64Emulator --headless --cycles 3000000 --video-standard ntsc --screenshot ntsc.bmp
+C64Emulator --headless --cycles 3000000 --expect-frame ready.bmp --tolerance 8
+C64Emulator game.d64 --cycles 20000000 --frames captures --every 250
+C64Emulator --suite regression.json
+C64Emulator --suite regression.json --record-missing
+C64Emulator --suite regression.json --record-all
+C64Emulator --suite regression.json --record-all --case ready
+C64Emulator --suite regression.json --list-cases
+C64Emulator --suite regression.json --list-cases --json
+C64Emulator --suite regression.json --list-cases --json --relative-paths
+C64Emulator --suite regression.json --list-cases --json --check-files
+```
+
+`--cycles` stops at the first instruction boundary at or after the requested
+count, so a run is reproducible. A media path implies headless mode and, when
+`--cycles` is omitted, runs for ten emulated seconds. Disks and tapes boot to
+the BASIC prompt first and then get the same `LOAD"*",8,1` / `RUN` keystrokes
+as the file menu's Space action, so boot loaders behave normally. PRGs are
+injected and cartridges are mounted with a reset. Frame composition is skipped
+headless unless a picture is requested, but sprite collisions and all chip
+timing still run.
+
+`--screenshot F` writes the last completed frame at the end of the run.
+`--frames DIR` writes completed frames as `frame_000001.bmp`, `frame_000002.bmp`
+and so on, saving one frame out of every `--every N` (default 25). Both use
+uncompressed 24-bit BMP, so no image codec is needed and the files are
+deterministic for a given media file and cycle count.
+
+`--video-standard pal|ntsc` selects the VIC model for a standalone run. PAL is
+the default; NTSC changes the clocks and produces 418x235 frames instead of
+403x284, including screenshots, frame dumps and `--expect-frame` references.
+It cannot be combined with `--suite`; use each case's `videoStandard` field
+instead.
+
+`--expect-frame F` compares the last completed frame, pixel for pixel, with
+the BMP at F and exits `6` on any difference. `--tolerance N` (0-255,
+default 0) allows up to N per-channel difference before a pixel counts as
+changed, which absorbs small palette or timing shifts between builds. On a
+mismatch the report includes the changed bounding box and the first changed
+pixel. References are ordinary 24-bit BMPs, such as those written by
+`--screenshot`, and must have the same dimensions. A reference that cannot be
+read exits `7`.
+
+`--suite F` runs a JSON list of checkpoints in one process, each with a fresh
+machine and its own run budget. Paths are resolved relative to the suite file:
+
+```json
+{
+  "cases": [
+    {
+      "name": "ready",
+      "cycles": 3000000,
+      "reference": "ready.bmp",
+      "tolerance": 8
+    },
+    {
+      "name": "defender-boot",
+      "media": "defender.d64",
+      "cycles": 20000000,
+      "reference": "defender.bmp",
+      "videoStandard": "ntsc"
+    }
+  ]
+}
+```
+
+`cycles` and `reference` are required; `media` is optional and is started
+exactly like a command-line media path; `tolerance` defaults to 0 and
+`videoStandard` is `pal` (the default) or `ntsc`. The standard selects both the
+emulated timing and the reference size: PAL frames are 403x284 and NTSC frames
+are 418x235. Comments and trailing commas are accepted. Each case prints `PASS`, `RECORD` or `FAIL` with
+the reason, followed by one `c64: suite: N passed, M failed` line. The suite
+exits `0` only when every case passes, `6` when any case fails (including a
+missing media or reference file), and `2` when the suite file is missing or
+invalid.
+
+Before any case runs, the suite checks the media and reference files for every
+selected case. Missing files, unrecognized or malformed media, unreadable or
+malformed reference BMPs, and references whose dimensions differ from the
+expected frame for the case's video standard (403x284 PAL or 418x235 NTSC)
+are all reported as `FAIL` lines; the run then stops without starting the
+emulator and exits `6`. Media is parsed with the same
+D64, T64, TAP and CRT loaders used for execution, and a PRG must contain a load
+address. `--record-missing` validates references that already exist but skips
+missing ones it will write. `--record-all` skips all reference checks.
+
+With `--record-missing`, a case whose `reference` file does not exist runs
+once and writes its final frame to that path, reported as `RECORD`; existing
+references are still compared. `--record-all` is the force mode: it rewrites
+every reference, including existing ones. Both modes write through a temporary
+file and replace the reference only after a successful run, so a failed or
+interrupted case leaves the previous baseline untouched. The summary adds a
+recorded count (`N passed, R recorded, M failed`), and recorded cases count as
+success, so a new or refreshed checkpoint needs one command.
+
+`--case NAME` limits a suite run to the named cases; repeat it to select
+several. Matching ignores case and the suite's order is kept. Use it alone to
+check one screen, or with `--record-all` to refresh one baseline. An unknown
+name exits `2` before any case runs.
+
+`--list-cases` prints the suite's case names in manifest order and exits
+without running the emulator. It accepts `--case` to list a subset and rejects
+`--record-missing`/`--record-all`. The output is one name per line with no
+header, so scripts can read it directly.
+
+Add `--json` to print an array of case objects instead of names. Each object
+has `name`, `cycles`, `media`, `reference`, `tolerance` and `videoStandard`;
+paths are resolved to absolute paths and `media` is null for cases without
+media. `--json` requires `--list-cases` and cannot be combined with recording
+flags.
+
+Add `--relative-paths` to print media and reference paths relative to the
+suite file with `/` separators instead of absolute paths. It requires `--json`.
+This keeps listings portable between machines and CI workspaces.
+
+Add `--check-files` to include `mediaExists` and `referenceExists` booleans
+and to exit `6` when any selected case has a missing media or reference file.
+`mediaExists` is null for cases without media. It requires `--json`, and the
+JSON is printed before the failure code.
+
+Exit codes are stable: `0` success, `1` runtime failure, `2` invalid command
+line, `3` media could not be started, `4` ROMs missing or invalid, `5` the
+BASIC prompt was not reached, `6` a frame check, suite case or file preflight
+failed, and `7` the reference frame could not be read.
+
 ## Known gaps and intentional limits
 
 These are deliberately not presented as complete:
 
-- The SID is a digital approximation. The 6581's nonlinear filter, exact
-  envelope counter quirks and all combined-waveform differences between the
-  6581 and 8580 are not modeled.
+- The SID is a signal-level approximation, not a reSID port. The envelope uses
+  the real rate-counter periods, exponential divider thresholds and hold-zero
+  behavior (including the skipped rate-counter zero), but the one-cycle
+  pipelining of register writes is not modeled. The 6581/8580 filters are SVF
+  approximations with per-model cutoff curves and 6581 input saturation, not a
+  transistor-level ladder. Combined waveforms are an AND of the digital outputs
+  with per-model attenuation rather than measured waveform tables.
 - D64 loads are virtual by default: standard KERNAL/BASIC `LOAD` calls are
   serviced directly from the image. The optional True Drive Emulation path
   runs the 1541 DOS, two VIAs and GCR disk over IEC. Standard multi-sector PRG

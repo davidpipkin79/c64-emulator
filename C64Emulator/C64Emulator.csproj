@@ -8,12 +8,12 @@
     <RootNamespace>C64Emulator</RootNamespace>
     <AssemblyName>C64Emulator</AssemblyName>
     <ApplicationIcon>c64icon.ico</ApplicationIcon>
-    <Version>1.0.0</Version>
+    <Version>2.0.0</Version>
     <AssemblyTitle>C64 Emulator</AssemblyTitle>
     <Description>Pipkinsoft C64 Emulator</Description>
     <Company>Pipkinsoft</Company>
     <Product>C64 Emulator</Product>
-    <Copyright>Copyright © 2009</Copyright>
+    <Copyright>Copyright © 2026</Copyright>
   </PropertyGroup>
 
   <!-- The emulation and rendering loops are too hot to run unoptimized.

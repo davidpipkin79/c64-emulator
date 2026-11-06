@@ -683,7 +683,7 @@ internal sealed class Vic : IVideoBank
         SetScreen(screen);
     }
 
-    private void RenderPixel(int x)
+    private void RenderPixel(int x, bool draw)
     {
         var y = currentHLine;
 
@@ -760,7 +760,8 @@ internal sealed class Vic : IVideoBank
         else
             color = firstFrontSpriteColor;
 
-        backBuffer[screenX, screenY] = color;
+        if (draw)
+            backBuffer[screenX, screenY] = color;
     }
 
     private Pixel GetBackgroundPixel(int x, int y)
@@ -1055,10 +1056,16 @@ internal sealed class Vic : IVideoBank
         if ((spriteFetchMask & (1UL << cycle)) != 0)
             IncrementStolenCycles();
 
-        if (!renderPixels)
+        // Sprite collisions are chip state, not a rendering side effect:
+        // they must keep updating while pixels are not drawn (warp), or a
+        // program polling $D01E/$D01F would miss them. With no sprite
+        // active on this line a collision is impossible, so the per-pixel
+        // work can still be skipped entirely.
+        if (!renderPixels && lineSpriteMask == 0)
             return;
 
-        frameRendered = true;
+        if (renderPixels)
+            frameRendered = true;
 
         var pixelStart = cycle * PixelsPerCycle - firstLinePixel;
 
@@ -1072,7 +1079,7 @@ internal sealed class Vic : IVideoBank
         for (var x = pixelStart; x < pixelEnd; x++)
         {
             if (x >= 0 && x < VisibleWidth)
-                RenderPixel(x);
+                RenderPixel(x, draw: renderPixels);
         }
     }
 

@@ -11,7 +11,8 @@ internal sealed class TestSystem : IDisposable
 {
     public TestSystem(bool withPeripherals = false, RomSet? roms = null)
     {
-        Memory = new Memory();
+        var dataBus = new BusLatch();
+        Memory = new Memory(dataBus);
         Interrupts = new InterruptLine();
         Cpu = new Cpu6510(Memory, Interrupts);
 
@@ -23,7 +24,7 @@ internal sealed class TestSystem : IDisposable
         Sid = new Sid();
         Cia1 = new Cia1(Interrupts);
         Cia2 = new Cia2(Interrupts, Vic);
-        Io = new IoController(Vic, Sid, ColorRam, Cia1, Cia2);
+        Io = new IoController(Vic, Sid, ColorRam, Cia1, Cia2, dataBus);
         Memory.Configure(
             roms ?? RomSet.Create(
                 new byte[AddressMap.KernalRomSize],

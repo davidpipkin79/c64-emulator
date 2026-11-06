@@ -85,6 +85,7 @@ internal sealed class C64Machine : IDisposable
     private volatile bool stopRequested;
     private volatile bool paused;
     private volatile bool fastForward;
+    private volatile bool renderFrames = true;
     private volatile bool running;
     private int speedPercentage = 100;
     private long frameDurationTicks = VideoTiming.Pal.FrameTicks;
@@ -118,7 +119,8 @@ internal sealed class C64Machine : IDisposable
         ArgumentNullException.ThrowIfNull(roms);
 
         Interrupts = new InterruptLine();
-        Memory = new Memory();
+        var dataBus = new BusLatch();
+        Memory = new Memory(dataBus);
         ColorRam = new ColorRam();
         Vic = new Vic(Memory, ColorRam, Interrupts);
         Sid = new Sid();
@@ -131,7 +133,7 @@ internal sealed class C64Machine : IDisposable
         Cia2 = new Cia2(Interrupts, Vic, Iec);
         Tape.AttachReadLine(Cia1.SetFlag);
         Memory.ProcessorPortWritten = OnProcessorPortWritten;
-        Io = new IoController(Vic, Sid, ColorRam, Cia1, Cia2);
+        Io = new IoController(Vic, Sid, ColorRam, Cia1, Cia2, dataBus);
         Memory.Configure(roms, Io);
         Sid.ClockFrequency = Vic.ClockHz;
         Cia1.TodClockFrequency = Vic.ClockHz;
@@ -211,6 +213,24 @@ internal sealed class C64Machine : IDisposable
     /// never follows disk or drive activity.
     /// </summary>
     public bool IsWarping => fastForward;
+
+    /// <summary>
+    /// False when the host has no display, as in a headless run without a
+    /// capture. Raster, DMA, interrupts and sprite collisions still advance,
+    /// but pixels are not composed. Frame events still fire, so a capture can
+    /// leave this true for its run.
+    /// </summary>
+    public bool RenderFrames
+    {
+        get => renderFrames;
+        set
+        {
+            renderFrames = value;
+
+            if (!value)
+                Vic.RenderPixels = false;
+        }
+    }
 
     /// <summary>
     /// Switches between the instant virtual KERNAL disk and the
@@ -355,6 +375,18 @@ internal sealed class C64Machine : IDisposable
     {
         Interlocked.Exchange(ref frameReady, 0);
     }
+
+    /// <summary>
+    /// Completed frames since power-on. Headless capture uses this instead of
+    /// wall-clock pacing, so screenshot timing follows emulated time.
+    /// </summary>
+    public long FrameCount { get; private set; }
+
+    /// <summary>
+    /// Raised on the emulation thread when the VIC completes a frame. Keep
+    /// handlers short; the headless frame dumper is the intended subscriber.
+    /// </summary>
+    public event Action? FrameCompleted;
 
     /// <summary>
     /// Default quick-save slot. It lives beside the executable so it is
@@ -541,9 +573,9 @@ internal sealed class C64Machine : IDisposable
     /// Runs a bounded number of CPU cycles synchronously. Intended for
     /// tests and deterministic boot probes, not for the interactive loop.
     /// </summary>
-    public void RunCycles(int cycles)
+    public long RunCycles(long cycles)
     {
-        var executedTotal = 0;
+        long executedTotal = 0;
 
         while (executedTotal < cycles)
         {
@@ -554,6 +586,8 @@ internal sealed class C64Machine : IDisposable
 
             executedTotal += executed;
         }
+
+        return executedTotal;
     }
 
     public void SoftReset()
@@ -595,6 +629,49 @@ internal sealed class C64Machine : IDisposable
 
         var program = File.ReadAllBytes(path);
         LoadProgramBytes(program, run: true);
+    }
+
+    /// <summary>
+    /// Starts a media file the way the file menu's Space action does. PRGs are
+    /// injected and run, disks and tapes are mounted and the matching BASIC
+    /// LOAD/RUN command is typed, and cartridges are mounted with a reset.
+    /// Returns the status text the menu displays.
+    /// </summary>
+    public string AutoStart(string path)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+
+        var name = Path.GetFileName(path);
+
+        switch (Path.GetExtension(path).ToLowerInvariant())
+        {
+            case ".prg":
+                LoadProgram(path);
+                return "Loaded " + name;
+
+            case ".d64":
+                MountDisk(path);
+                TypeText("LOAD\"*\",8,1\rRUN\r");
+                return "Mounted " + name + ": LOAD\"*\",8,1";
+
+            case ".t64":
+                MountTape(path);
+                TypeText("LOAD\"*\",1,1\rRUN\r");
+                return "Mounted " + name + ": LOAD\"*\",1,1";
+
+            case ".tap":
+                MountTape(path);
+                TypeText("LOAD\"\",1,1\rRUN\r");
+                return "Mounted " + name + ": LOAD\"\",1,1";
+
+            case ".crt":
+                MountCartridge(path);
+                return "Mounted cartridge " + name;
+
+            default:
+                throw new NotSupportedException(
+                    "Unsupported media type: " + Path.GetExtension(path));
+        }
     }
 
     /// <summary>
@@ -818,6 +895,12 @@ internal sealed class C64Machine : IDisposable
 
     private void UpdateWarpRendering()
     {
+        if (!renderFrames)
+        {
+            Vic.RenderPixels = false;
+            return;
+        }
+
         if (!fastForward)
         {
             Vic.RenderPixels = true;
@@ -1599,6 +1682,8 @@ internal sealed class C64Machine : IDisposable
         if (Vic.Tick(1))
         {
             Interlocked.Exchange(ref frameReady, 1);
+            FrameCount++;
+            FrameCompleted?.Invoke();
             UpdateWarpRendering();
         }
 

@@ -851,6 +851,39 @@ public sealed class VicTests : IDisposable
         Assert.Equal(2, PaletteIndexAt(screen, 44, 55 - 9));
     }
 
+    [Fact]
+    public void SpriteCollisions_UpdateWithoutRendering()
+    {
+        Vic vic = system.Vic!;
+        vic.RenderPixels = false;
+
+        // $D018=$00 puts the sprite pointers at $C3F8. Two fully opaque
+        // sprites sit on top of each other on raster 101.
+        vic.SetRegister(0x18, 0x00);
+        system.Memory.Poke(0xC3F8, 0x01);
+        system.Memory.Poke(0xC3F9, 0x02);
+
+        for (var i = 0; i < 63; i++)
+        {
+            system.Memory.Poke((ushort)(0xC040 + i), 0xFF);
+            system.Memory.Poke((ushort)(0xC080 + i), 0xFF);
+        }
+
+        vic.SetRegister(0x15, 0x03); // sprites 0 and 1
+        vic.SetRegister(0x27, 0x02);
+        vic.SetRegister(0x28, 0x03);
+        vic.SetRegister(0x00, 100);
+        vic.SetRegister(0x01, 100);
+        vic.SetRegister(0x02, 100);
+        vic.SetRegister(0x03, 100);
+
+        // Collisions are chip state, not a side effect of drawing pixels:
+        // they must still be latched while warp suppresses the renderer.
+        vic.Tick(vic.FrameCycles);
+
+        Assert.NotEqual(0, vic.GetRegister(0x1E) & 0x03);
+    }
+
     private void ConfigureCharacterPattern()
     {
         Vic vic = system.Vic!;

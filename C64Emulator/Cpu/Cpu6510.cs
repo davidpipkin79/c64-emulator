@@ -301,6 +301,7 @@ internal sealed class Cpu6510(IMemoryBus bus, InterruptLine interrupts)
     private Registers registers;
     private int cycles;
     private bool jammed;
+    private bool irqPollBlocked;
 
     public void SetPC(ushort address)
     {
@@ -1262,11 +1263,19 @@ internal sealed class Cpu6510(IMemoryBus bus, InterruptLine interrupts)
         if (interrupts.IsNmiAsserted)
         {
             interrupts.AcknowledgeNmi();
+            irqPollBlocked = false;
             nmi();
             return cycles;
         }
 
-        if (interrupts.IsIrqAsserted && !getFlag(StatusFlags.I))
+        if (irqPollBlocked)
+        {
+            // CLI/SEI/PLP/RTI change I during their last cycle, after the
+            // 6502 has already polled the line for this boundary. The next
+            // instruction therefore runs before an IRQ can be recognised.
+            irqPollBlocked = false;
+        }
+        else if (interrupts.IsIrqAsserted && !getFlag(StatusFlags.I))
         {
             irq();
             return cycles;
@@ -1708,6 +1717,15 @@ internal sealed class Cpu6510(IMemoryBus bus, InterruptLine interrupts)
             case Instructions.SRE_aby: address = absoluteYForWrite(); eorValue(lsr(address)); break;
             case Instructions.SRE_izx: address = indirectX(); eorValue(lsr(address)); break;
             case Instructions.SRE_izy: address = indirectYForWrite(); eorValue(lsr(address)); break;
+        }
+
+        if ((Instructions)instruction is
+            Instructions.CLI or
+            Instructions.SEI or
+            Instructions.PLP or
+            Instructions.RTI)
+        {
+            irqPollBlocked = true;
         }
 
         return cycles;
