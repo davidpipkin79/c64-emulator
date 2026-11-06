@@ -43,21 +43,15 @@ internal struct Pixel
 internal sealed class Vic : IVideoBank
 {
     public const int RegisterCount = 47;
-    public const int CyclesPerLine = 63;
-    public const int RasterLines = 312;
-    public const int CyclesPerFrame = CyclesPerLine * RasterLines;
+    public const int PixelsPerCycle = 8;
 
-    // PAL 6569: line 0 is one cycle short and the last line is one cycle
-    // long. The frame still totals 19656 cycles.
-    private const int FirstLineCycles = 62;
-    private const int LastLineCycles = 64;
-    private const int PixelsPerCycle = 8;
+    // The longest raster line the emulator models (NTSC 6567R8).
+    public const int MaxLineCycles = 65;
 
-    public const int VisibleWidth = 403;        // including border
-    public const int VisibleHeight = 284;       // including border
-
-    private const int FirstRasterLine = 9;
-    private const int LastRasterLine = 293;
+    // PAL pixel origin: cycle 0 starts 96 pixels before the left edge of
+    // the visible window. The NTSC 6567R8 inserts one extra cycle at the
+    // start of each line, so its accesses and pixels sit eight pixels
+    // further along; firstLinePixel carries that per-standard shift.
     private const int FirstLinePixel = 96;
     private const int FirstDisplayLine = 48;
     private const int FirstScreenLine = 51;
@@ -75,6 +69,9 @@ internal sealed class Vic : IVideoBank
     private readonly Pixel emptyPixel;
     private volatile bool renderPixels = true;
     private bool frameRendered;
+    private VideoTiming timing;
+    private C64Palette palette;
+    private int firstLinePixel = FirstLinePixel;
 
     // A badline fetches one complete 40-byte video-matrix row and its
     // matching Color RAM nibbles. The display pipeline then reuses those
@@ -93,7 +90,7 @@ internal sealed class Vic : IVideoBank
     [NonSerialized] private ulong spriteFetchMask;
     [NonSerialized] private ulong spriteLeadMask;
     [NonSerialized] private byte lineSpriteMask;
-    [NonSerialized] private readonly sbyte[] spriteFetchOwner = new sbyte[64];
+    [NonSerialized] private readonly sbyte[] spriteFetchOwner = new sbyte[MaxLineCycles];
 
     // Sprite data for the next raster line is fetched in the sprite's
     // bus slots during the current line, then swapped in at the line
@@ -109,8 +106,8 @@ internal sealed class Vic : IVideoBank
     private int rowCounter;
     private int stolenCycles;
 
-    private RgbColor[,] frontBuffer = new RgbColor[VisibleWidth, VisibleHeight];
-    private RgbColor[,] backBuffer = new RgbColor[VisibleWidth, VisibleHeight];
+    private RgbColor[,] frontBuffer;
+    private RgbColor[,] backBuffer;
 
     private ushort bankAddress;
     private ushort videoMatrixAddress;
@@ -137,14 +134,24 @@ internal sealed class Vic : IVideoBank
     private int rasterIrqCountdown;
     private bool borderFlipFlop;
 
-    public Vic(IVideoBus bus, ColorRam colorRam, InterruptLine interrupts)
+    public Vic(
+        IVideoBus bus,
+        ColorRam colorRam,
+        InterruptLine interrupts,
+        VideoStandard standard = VideoStandard.Pal)
     {
         this.bus = bus ?? throw new ArgumentNullException(nameof(bus));
         this.colorRam = colorRam ?? throw new ArgumentNullException(nameof(colorRam));
         this.interrupts = interrupts ?? throw new ArgumentNullException(nameof(interrupts));
 
+        timing = VideoTiming.For(standard);
+        palette = C64Palette.For(standard);
+        firstLinePixel = FirstLinePixel + timing.BusCycleOffset * PixelsPerCycle;
+        frontBuffer = new RgbColor[timing.VisibleWidth, timing.VisibleLines];
+        backBuffer = new RgbColor[timing.VisibleWidth, timing.VisibleLines];
+
         emptyPixel.Background = true;
-        emptyPixel.PixelColor = C64Palette.Get(0);
+        emptyPixel.PixelColor = palette.Get(0);
 
         Reset();
     }
@@ -168,7 +175,7 @@ internal sealed class Vic : IVideoBank
                 MulticolorMode = false,
                 DoubleWidth = false,
                 TopMost = true,
-                SpriteColor = C64Palette.Get(0)
+                SpriteColor = palette.Get(0)
             };
         }
 
@@ -261,6 +268,66 @@ internal sealed class Vic : IVideoBank
 
     public int RasterCycle => currentCycle;
 
+    public VideoStandard VideoStandard => timing.Standard;
+
+    /// <summary>CPU clock of the active VIC model.</summary>
+    public int ClockHz => timing.ClockHz;
+
+    /// <summary>Total CPU cycles in one frame of the active model.</summary>
+    public int FrameCycles => timing.FrameCycles;
+
+    public int RasterLineCount => timing.RasterLines;
+
+    /// <summary>Visible width in pixels, borders included.</summary>
+    public int VisibleWidth => timing.VisibleWidth;
+
+    /// <summary>Visible height in raster lines, borders included.</summary>
+    public int VisibleHeight => timing.VisibleLines;
+
+    /// <summary>Left edge of the standard 40-column display window.</summary>
+    public int DisplayLeft => FirstScreenPixel;
+
+    /// <summary>Top row of the display window in the visible frame.</summary>
+    public int DisplayTop
+    {
+        get
+        {
+            timing.TryGetVisibleRow(FirstScreenLine, out var row);
+            return row;
+        }
+    }
+
+    /// <summary>Width of the 40-column display window in pixels.</summary>
+    public int DisplayWidth => LastScreenPixel - FirstScreenPixel + 1;
+
+    /// <summary>Height of the 25-row display window in pixels.</summary>
+    public int DisplayHeight => LastScreenLine - FirstScreenLine + 1;
+
+    public long FrameTicks => timing.FrameTicks;
+
+    /// <summary>
+    /// Switches between the PAL 6569 and NTSC 6567R8 models. The caller
+    /// pauses the machine, so the frame buffers may be resized here. The
+    /// register state is reset because the raster geometry changed.
+    /// </summary>
+    public void SetVideoStandard(VideoStandard standard)
+    {
+        if (timing.Standard == standard)
+            return;
+
+        timing = VideoTiming.For(standard);
+        palette = C64Palette.For(standard);
+        firstLinePixel = FirstLinePixel + timing.BusCycleOffset * PixelsPerCycle;
+
+        lock (screenLock)
+        {
+            frontBuffer = new RgbColor[timing.VisibleWidth, timing.VisibleLines];
+            backBuffer = new RgbColor[timing.VisibleWidth, timing.VisibleLines];
+
+            Reset();
+        }
+    }
+
     /// <summary>
     /// When false, the VIC still advances raster, fetch, DMA, and interrupt
     /// state, but leaves the last completed picture in the front buffer.
@@ -300,14 +367,24 @@ internal sealed class Vic : IVideoBank
 
         if (
             destination.GetLength(0) != VisibleWidth ||
-            destination.GetLength(1) != VisibleHeight)
+            destination.GetLength(1) < VisibleHeight)
         {
-            throw new ArgumentException("Destination must be 403 x 284.", nameof(destination));
+            throw new ArgumentException(
+                $"Destination must be {VisibleWidth} x {VisibleHeight} or larger.",
+                nameof(destination));
         }
 
         lock (screenLock)
         {
-            Array.Copy(frontBuffer, destination, frontBuffer.Length);
+            if (destination.GetLength(1) == frontBuffer.GetLength(1))
+            {
+                Array.Copy(frontBuffer, destination, frontBuffer.Length);
+                return;
+            }
+
+            for (var y = 0; y < VisibleHeight; y++)
+                for (var x = 0; x < VisibleWidth; x++)
+                    destination[x, y] = frontBuffer[x, y];
         }
     }
 
@@ -322,7 +399,9 @@ internal sealed class Vic : IVideoBank
             screen.GetLength(0) != VisibleWidth ||
             screen.GetLength(1) != VisibleHeight)
         {
-            throw new ArgumentException("Screen must be 403 x 284.", nameof(screen));
+            throw new ArgumentException(
+                $"Screen must be {VisibleWidth} x {VisibleHeight}.",
+                nameof(screen));
         }
 
         lock (screenLock)
@@ -352,7 +431,7 @@ internal sealed class Vic : IVideoBank
                 currentCycle = 0;
                 currentHLine++;
 
-                if (currentHLine >= RasterLines)
+                if (currentHLine >= timing.RasterLines)
                 {
                     currentHLine = 0;
                     CompleteFrame();
@@ -536,7 +615,7 @@ internal sealed class Vic : IVideoBank
                 break;
 
             case >= 0x27 and <= 0x2E:
-                sprites[register - 0x27].SpriteColor = C64Palette.Get(value);
+                sprites[register - 0x27].SpriteColor = palette.Get(value);
                 break;
         }
 
@@ -564,14 +643,14 @@ internal sealed class Vic : IVideoBank
             {
                 var x = i % VisibleWidth;
                 var y = i / VisibleWidth;
-                var high = C64Palette.ToIndex(frontBuffer[x, y]);
+                var high = palette.ToIndex(frontBuffer[x, y]);
                 var low = 0;
 
                 if (i + 1 < pixelCount)
                 {
                     var nextX = (i + 1) % VisibleWidth;
                     var nextY = (i + 1) / VisibleWidth;
-                    low = C64Palette.ToIndex(frontBuffer[nextX, nextY]);
+                    low = palette.ToIndex(frontBuffer[nextX, nextY]);
                 }
 
                 packed[position++] = (byte)((high << 4) | low);
@@ -592,12 +671,12 @@ internal sealed class Vic : IVideoBank
         for (var i = 0; i < pixelCount && position < packed.Length; i += 2)
         {
             var value = packed[position++];
-            screen[i % VisibleWidth, i / VisibleWidth] = C64Palette.Get(value >> 4);
+            screen[i % VisibleWidth, i / VisibleWidth] = palette.Get(value >> 4);
 
             if (i + 1 < pixelCount)
             {
                 screen[(i + 1) % VisibleWidth, (i + 1) / VisibleWidth] =
-                    C64Palette.Get(value & 0x0F);
+                    palette.Get(value & 0x0F);
             }
         }
 
@@ -608,27 +687,20 @@ internal sealed class Vic : IVideoBank
     {
         var y = currentHLine;
 
-        if (y < FirstRasterLine || y >= LastRasterLine)
+        if (!timing.TryGetVisibleRow(y, out var screenY))
             return;
 
         var screenX = x;
-        var screenY = y - FirstRasterLine;
 
-        if (
-            screenX < 0 ||
-            screenX >= VisibleWidth ||
-            screenY < 0 ||
-            screenY >= VisibleHeight)
-        {
+        if (screenX < 0 || screenX >= VisibleWidth)
             return;
-        }
 
         Pixel pixel = GetBackgroundPixel(x, y);
         var collisionMask = 0;
         var firstSprite = -1;
         var firstFrontSprite = -1;
-        RgbColor firstSpriteColor = C64Palette.Get(0);
-        RgbColor firstFrontSpriteColor = C64Palette.Get(0);
+        RgbColor firstSpriteColor = palette.Get(0);
+        RgbColor firstFrontSpriteColor = palette.Get(0);
         var localX = x - SpriteXOrigin;
 
         for (var sprite = 0; sprite < 8; sprite++)
@@ -713,7 +785,7 @@ internal sealed class Vic : IVideoBank
             return new Pixel
             {
                 Background = true,
-                PixelColor = C64Palette.Get(registers[0x20])
+                PixelColor = palette.Get(registers[0x20])
             };
         }
 
@@ -740,7 +812,7 @@ internal sealed class Vic : IVideoBank
             return new Pixel
             {
                 Background = true,
-                PixelColor = C64Palette.Get(registers[0x21])
+                PixelColor = palette.Get(registers[0x21])
             };
         }
 
@@ -777,7 +849,7 @@ internal sealed class Vic : IVideoBank
                 1 => new Pixel
                 {
                     Background = false,
-                    PixelColor = C64Palette.Get(registers[0x25])
+                    PixelColor = palette.Get(registers[0x25])
                 },
                 2 => new Pixel
                 {
@@ -787,7 +859,7 @@ internal sealed class Vic : IVideoBank
                 _ => new Pixel
                 {
                     Background = false,
-                    PixelColor = C64Palette.Get(registers[0x26])
+                    PixelColor = palette.Get(registers[0x26])
                 }
             };
         }
@@ -827,14 +899,14 @@ internal sealed class Vic : IVideoBank
             return new Pixel
             {
                 Background = false,
-                PixelColor = C64Palette.Get(colorRow[cell])
+                PixelColor = palette.Get(colorRow[cell])
             };
         }
 
         return new Pixel
         {
             Background = true,
-            PixelColor = C64Palette.Get(registers[0x21])
+            PixelColor = palette.Get(registers[0x21])
         };
     }
 
@@ -853,22 +925,22 @@ internal sealed class Vic : IVideoBank
             0 => new Pixel
             {
                 Background = true,
-                PixelColor = C64Palette.Get(registers[0x21])
+                PixelColor = palette.Get(registers[0x21])
             },
             1 => new Pixel
             {
                 Background = false,
-                PixelColor = C64Palette.Get(registers[0x22])
+                PixelColor = palette.Get(registers[0x22])
             },
             2 => new Pixel
             {
                 Background = false,
-                PixelColor = C64Palette.Get(registers[0x23])
+                PixelColor = palette.Get(registers[0x23])
             },
             _ => new Pixel
             {
                 Background = false,
-                PixelColor = C64Palette.Get(colorRow[cell] & 0x07)
+                PixelColor = palette.Get(colorRow[cell] & 0x07)
             }
         };
     }
@@ -884,14 +956,14 @@ internal sealed class Vic : IVideoBank
             return new Pixel
             {
                 Background = false,
-                PixelColor = C64Palette.Get(colorRow[cell])
+                PixelColor = palette.Get(colorRow[cell])
             };
         }
 
         return new Pixel
         {
             Background = true,
-            PixelColor = C64Palette.Get(registers[0x21 + backgroundIndex])
+            PixelColor = palette.Get(registers[0x21 + backgroundIndex])
         };
     }
 
@@ -906,14 +978,14 @@ internal sealed class Vic : IVideoBank
             return new Pixel
             {
                 Background = false,
-                PixelColor = C64Palette.Get(color >> 4)
+                PixelColor = palette.Get(color >> 4)
             };
         }
 
         return new Pixel
         {
             Background = true,
-            PixelColor = C64Palette.Get(color & 0x0F)
+            PixelColor = palette.Get(color & 0x0F)
         };
     }
 
@@ -929,41 +1001,51 @@ internal sealed class Vic : IVideoBank
             0 => new Pixel
             {
                 Background = true,
-                PixelColor = C64Palette.Get(registers[0x21])
+                PixelColor = palette.Get(registers[0x21])
             },
             1 => new Pixel
             {
                 Background = false,
-                PixelColor = C64Palette.Get(color >> 4)
+                PixelColor = palette.Get(color >> 4)
             },
             2 => new Pixel
             {
                 Background = false,
-                PixelColor = C64Palette.Get(color & 0x0F)
+                PixelColor = palette.Get(color & 0x0F)
             },
             _ => new Pixel
             {
                 Background = false,
-                PixelColor = C64Palette.Get(colorRow[cell])
+                PixelColor = palette.Get(colorRow[cell])
             }
         };
     }
 
     private void ProcessVideoCycle(int cycle)
     {
-        // PAL 6569 access table. The 40 c-accesses run on cycles 15-54 in
-        // the VIC's second phase, which is what steals the CPU during a
-        // badline; the matching g-accesses follow one cycle later in the
-        // normal first phase (16-55). The fetched graphics byte reaches
-        // the shift register twelve pixels before it is displayed.
-        if (lineIsBadline && cycle >= 15 && cycle <= 54)
+        // VIC-II access table. The 40 c-accesses run in the VIC's second
+        // phase, which is what steals the CPU during a badline, and the
+        // matching g-accesses follow one cycle later in the normal first
+        // phase. The NTSC 6567R8 has one extra cycle at the start of the
+        // line, so both runs move one cycle later there: 15-54 and 16-55
+        // on the 6569, 16-55 and 17-56 on the 6567R8. The fetched byte
+        // reaches the shift register twelve pixels before it is displayed.
+        var busOffset = timing.BusCycleOffset;
+        var matrixFetchStart = 15 + busOffset;
+
+        if (
+            lineIsBadline &&
+            cycle >= matrixFetchStart &&
+            cycle < matrixFetchStart + 40)
         {
-            FetchMatrixCell(cycle - 15);
+            FetchMatrixCell(cycle - matrixFetchStart);
             IncrementStolenCycles();
         }
 
-        if (cycle >= 16 && cycle <= 55)
-            FetchGlyphCell(cycle - 16);
+        var glyphFetchStart = 16 + busOffset;
+
+        if (cycle >= glyphFetchStart && cycle < glyphFetchStart + 40)
+            FetchGlyphCell(cycle - glyphFetchStart);
 
         var fetchSprite = spriteFetchOwner[cycle];
 
@@ -978,9 +1060,16 @@ internal sealed class Vic : IVideoBank
 
         frameRendered = true;
 
-        var pixelStart = cycle * PixelsPerCycle - FirstLinePixel;
+        var pixelStart = cycle * PixelsPerCycle - firstLinePixel;
 
-        for (var x = pixelStart; x < pixelStart + PixelsPerCycle; x++)
+        // The last cycle of a line runs into the right border. On NTSC the
+        // extra cycle leaves two visible columns beyond the normal eight,
+        // so the border is drawn out to the right edge of the picture.
+        var pixelEnd = cycle == GetLineCycles(currentHLine) - 1
+            ? VisibleWidth
+            : pixelStart + PixelsPerCycle;
+
+        for (var x = pixelStart; x < pixelEnd; x++)
         {
             if (x >= 0 && x < VisibleWidth)
                 RenderPixel(x);
@@ -1155,7 +1244,8 @@ internal sealed class Vic : IVideoBank
             for (
                 var cycle = Math.Max(0, lineCycles + nextFirstCycle - 3);
                 cycle < lineCycles;
-                cycle++)
+                cycle++
+            )
             {
                 lead |= 1UL << cycle;
             }
@@ -1211,10 +1301,17 @@ internal sealed class Vic : IVideoBank
 
     private bool IsAecLow(int cycle)
     {
-        if (lineIsBadline && cycle >= 15 && cycle <= 54)
+        var busOffset = timing.BusCycleOffset;
+        var matrixFetchStart = 15 + busOffset;
+
+        if (
+            lineIsBadline &&
+            cycle >= matrixFetchStart &&
+            cycle < matrixFetchStart + 40)
             return true;
 
-        return (uint)cycle < 64 &&
+        // NTSC lines are 65 cycles long, so the last one must stay usable.
+        return (uint)cycle < MaxLineCycles &&
             (spriteFetchMask & (1UL << cycle)) != 0;
     }
 
@@ -1223,12 +1320,15 @@ internal sealed class Vic : IVideoBank
         if (IsAecLow(cycle))
             return true;
 
-        // The badline C-access run starts on cycle 15, so BA is asserted
-        // on cycles 12-14 to give the 6510 time to finish a write.
-        if (lineIsBadline && cycle >= 12 && cycle < 15)
+        // The badline C-access run starts on cycle 15 (16 on NTSC), so BA
+        // is asserted three cycles earlier to give the 6510 time to finish
+        // a write.
+        var leadStart = 12 + timing.BusCycleOffset;
+
+        if (lineIsBadline && cycle >= leadStart && cycle < leadStart + 3)
             return true;
 
-        return (uint)cycle < 64 &&
+        return (uint)cycle < MaxLineCycles &&
             (spriteLeadMask & (1UL << cycle)) != 0;
     }
 
@@ -1237,7 +1337,7 @@ internal sealed class Vic : IVideoBank
         if (!sprites[sprite].Enabled)
             return false;
 
-        var nextLine = currentHLine + 1 >= RasterLines
+        var nextLine = currentHLine + 1 >= timing.RasterLines
             ? 0
             : currentHLine + 1;
 
@@ -1246,9 +1346,10 @@ internal sealed class Vic : IVideoBank
             spriteDmaRemaining[sprite] > 0;
     }
 
-    private static int GetSpriteFetchCycle(int sprite)
+    private int GetSpriteFetchCycle(int sprite)
     {
-        return sprite switch
+        // Sprite p/s-access slots, one cycle later on the 6567R8.
+        return timing.BusCycleOffset + sprite switch
         {
             0 => 57,
             1 => 59,
@@ -1322,19 +1423,19 @@ internal sealed class Vic : IVideoBank
         // At cycle 0 of line 0 the raster counter still reads the last
         // line of the previous frame on a PAL 6569.
         return currentHLine == 0 && currentCycle == 0
-            ? RasterLines - 1
+            ? timing.RasterLines - 1
             : currentHLine;
     }
 
-    private static int GetLineCycles(int line)
+    private int GetLineCycles(int line)
     {
         if (line == 0)
-            return FirstLineCycles;
+            return timing.FirstLineCycles;
 
-        if (line == RasterLines - 1)
-            return LastLineCycles;
+        if (line == timing.RasterLines - 1)
+            return timing.LastLineCycles;
 
-        return CyclesPerLine;
+        return timing.CyclesPerLine;
     }
 
     private void UpdateIrq()

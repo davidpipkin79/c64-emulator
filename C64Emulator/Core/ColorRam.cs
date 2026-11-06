@@ -28,9 +28,11 @@ internal sealed class ColorRam
         values[offset % AddressMap.ColorRamSize] = (byte)(value & 0x0F);
     }
 
-    public RgbColor GetColor(ushort offset)
+    public RgbColor GetColor(ushort offset, VideoStandard standard)
     {
-        return C64Palette.Get(values[offset % AddressMap.ColorRamSize]);
+        return C64Palette
+            .For(standard)
+            .Get(values[offset % AddressMap.ColorRamSize]);
     }
 
     public void Clear()

@@ -5,6 +5,7 @@ using System.Text.Json.Serialization;
 using System.Threading;
 using C64Emulator.Core;
 using C64Emulator.Input;
+using C64Emulator.Video;
 
 namespace C64Emulator.Host;
 
@@ -26,9 +27,30 @@ internal sealed class AppSettings
 
     public bool Fullscreen { get; set; }
 
+    /// <summary>
+    /// In fullscreen, scale the picture to the display height instead of
+    /// fitting the whole frame. The sides are cropped only when the display
+    /// is narrower than the C64 picture.
+    /// </summary>
+    public bool FullscreenFillHeight { get; set; } = true;
+
     public int ResolutionWidth { get; set; } = 806;
 
     public int ResolutionHeight { get; set; } = 568;
+
+    /// <summary>
+    /// Windowed size last used with each video standard, so switching back
+    /// restores that standard's own window instead of the other one's size.
+    /// Zero means the standard has not been shown yet; the first switch then
+    /// keeps the current integer zoom and stores the resulting size.
+    /// </summary>
+    public int PalWindowWidth { get; set; }
+
+    public int PalWindowHeight { get; set; }
+
+    public int NtscWindowWidth { get; set; }
+
+    public int NtscWindowHeight { get; set; }
 
     /// <summary>
     /// Fullscreen refresh rate in Hz. Zero selects the first mode with the
@@ -41,6 +63,19 @@ internal sealed class AppSettings
     /// A 50 Hz fullscreen mode plus VSync matches the PAL frame cadence.
     /// </summary>
     public bool VSync { get; set; } = true;
+
+    /// <summary>
+    /// Draw a subtle dark line between every other presented row. This is a
+    /// host-only display effect and is off by default.
+    /// </summary>
+    public bool Scanlines { get; set; }
+
+    /// <summary>
+    /// PAL timing is the default; NTSC can be selected in the Display menu
+    /// and is restored on the next start.
+    /// </summary>
+    public VideoStandard VideoStandard { get; set; } =
+        C64Emulator.Video.VideoStandard.Pal;
 
     /// <summary>
     /// Map host keys to the C64 key that prints the typed character (the
@@ -141,9 +176,24 @@ internal sealed class AppSettings
         LastMediaDirectory = LastMediaDirectory ?? string.Empty;
         ResolutionWidth = Math.Max(403, ResolutionWidth);
         ResolutionHeight = Math.Max(284, ResolutionHeight);
+        PalWindowWidth = PalWindowWidth > 0 && PalWindowHeight > 0
+            ? Math.Max(VideoTiming.Pal.PresentationWidth, PalWindowWidth)
+            : 0;
+        PalWindowHeight = PalWindowWidth > 0
+            ? Math.Max(VideoTiming.Pal.VisibleLines, PalWindowHeight)
+            : 0;
+        NtscWindowWidth = NtscWindowWidth > 0 && NtscWindowHeight > 0
+            ? Math.Max(VideoTiming.Ntsc.PresentationWidth, NtscWindowWidth)
+            : 0;
+        NtscWindowHeight = NtscWindowWidth > 0
+            ? Math.Max(VideoTiming.Ntsc.VisibleLines, NtscWindowHeight)
+            : 0;
         DisplayRefreshRate = Math.Max(0, DisplayRefreshRate);
         AudioVolume = Math.Clamp(AudioVolume, 0, 100);
         AudioDevice = AudioDevice ?? string.Empty;
+
+        if (!Enum.IsDefined(typeof(C64Emulator.Video.VideoStandard), VideoStandard))
+            VideoStandard = C64Emulator.Video.VideoStandard.Pal;
     }
 
     public void Save()

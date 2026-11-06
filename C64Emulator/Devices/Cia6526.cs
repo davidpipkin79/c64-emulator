@@ -11,13 +11,16 @@ namespace C64Emulator.Devices;
 /// </summary>
 internal abstract class Cia6526
 {
-    private const int TodClockCycles = 98500;
+    private const int DefaultTodClockCycles = 98_524;
 
     private readonly InterruptLine interrupts;
     private readonly InterruptSource interruptSource;
     private readonly bool useNmi;
 
     private int todCycles;
+
+    [System.NonSerialized]
+    private int todClockCycles = DefaultTodClockCycles;
     private int todTenths;
     private int todSeconds;
     private int todMinutes;
@@ -80,6 +83,17 @@ internal abstract class Cia6526
     protected bool TimerAOutputHigh => timerAOutputState || timerAPulse;
 
     protected bool TimerBOutputHigh => timerBOutputState || timerBPulse;
+
+    /// <summary>
+    /// CPU clock used by the time-of-day counter. TOD advances once per
+    /// tenth of a second, so its interval follows the machine clock rather
+    /// than the mains frequency.
+    /// </summary>
+    public int TodClockFrequency
+    {
+        get => todClockCycles;
+        set => todClockCycles = Math.Max(1, value / 10);
+    }
 
     public virtual void Reset()
     {
@@ -476,9 +490,9 @@ internal abstract class Cia6526
 
         todCycles += cycles;
 
-        while (todCycles >= TodClockCycles)
+        while (todCycles >= todClockCycles)
         {
-            todCycles -= TodClockCycles;
+            todCycles -= todClockCycles;
             AdvanceTod();
         }
     }

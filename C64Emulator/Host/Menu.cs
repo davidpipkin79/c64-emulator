@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using C64Emulator.Audio;
@@ -8,6 +9,7 @@ using C64Emulator.Devices;
 using C64Emulator.Input;
 using C64Emulator.Media;
 using C64Emulator.Networking;
+using C64Emulator.Video;
 
 namespace C64Emulator.Host;
 
@@ -28,7 +30,17 @@ internal sealed class MenuList(string text, string command, string[]? args = nul
 /// </summary>
 internal sealed class Menu(Renderer renderer, C64Machine machine, Network network, AudioOutput audio)
 {
-    public const int MaxItems = 9;
+    private int MaxItems => MaxItemsFor(machine.Vic.VisibleHeight);
+
+    /// <summary>
+    /// Rows the menu can show without running past the bottom of the
+    /// display window. Both standards have the same 200-line window, so
+    /// both fit nine rows at the normal spacing.
+    /// </summary>
+    public static int MaxItemsFor(int visibleHeight)
+    {
+        return visibleHeight >= 200 ? 9 : 6;
+    }
 
     private readonly List<MenuList> menuList = [];
     private readonly Renderer renderer = renderer ?? throw new ArgumentNullException(nameof(renderer));
@@ -36,7 +48,16 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
     private readonly Network network = network ?? throw new ArgumentNullException(nameof(network));
     private readonly AudioOutput audio = audio ?? throw new ArgumentNullException(nameof(audio));
 
+    private const int NavigationRepeatDelayMs = 400;
+    private const int NavigationRepeatIntervalMs = 70;
+    private static readonly long NavigationRepeatDelay =
+        Stopwatch.Frequency * NavigationRepeatDelayMs / 1000;
+    private static readonly long NavigationRepeatInterval =
+        Stopwatch.Frequency * NavigationRepeatIntervalMs / 1000;
+
     private bool active;
+    private Key? heldNavigationKey;
+    private long nextNavigationRepeat;
     private int selectedItem;
     private int currentPosition;
     private string networkAddress = AppSettings.Current.LastHost;
@@ -63,6 +84,7 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                 return;
 
             active = value;
+            heldNavigationKey = null;
 
             if (active)
             {
@@ -76,20 +98,69 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
 
     public void KeyEvent(KeyboardEventArgs key)
     {
-        if (!key.Down)
+        if (settingKeyset)
         {
-            if (settingKeyset)
-            {
+            if (!key.Down)
                 CaptureKeySet(key);
-            }
-            else
-            {
-                Navigate(key);
-            }
+
+            if (active)
+                renderer.DrawMenu(menuList, selectedItem, currentPosition, HintText);
+
+            return;
         }
+
+        if (key.Key is Key.UpArrow or Key.DownArrow)
+        {
+            if (key.Down)
+                BeginNavigationRepeat(key.Key);
+            else if (heldNavigationKey == key.Key)
+                heldNavigationKey = null;
+
+            if (active)
+                renderer.DrawMenu(menuList, selectedItem, currentPosition, HintText);
+
+            return;
+        }
+
+        if (!key.Down)
+            Navigate(key);
 
         if (active)
             renderer.DrawMenu(menuList, selectedItem, currentPosition, HintText);
+    }
+
+    /// <summary>
+    /// Advances held Up/Down navigation independently of platform key-repeat
+    /// timing. The host loop calls this while the menu is active.
+    /// </summary>
+    public void Update()
+    {
+        if (!active || settingKeyset || heldNavigationKey is not { } key)
+            return;
+
+        var now = Stopwatch.GetTimestamp();
+
+        if (now < nextNavigationRepeat)
+            return;
+
+        nextNavigationRepeat = now + NavigationRepeatInterval;
+        Navigate(new KeyboardEventArgs(key, ModifierKeys.None, false));
+        renderer.DrawMenu(menuList, selectedItem, currentPosition, HintText);
+    }
+
+    public void ResetNavigation()
+    {
+        heldNavigationKey = null;
+    }
+
+    private void BeginNavigationRepeat(Key key)
+    {
+        if (heldNavigationKey == key)
+            return;
+
+        heldNavigationKey = key;
+        nextNavigationRepeat = Stopwatch.GetTimestamp() + NavigationRepeatDelay;
+        Navigate(new KeyboardEventArgs(key, ModifierKeys.None, false));
     }
 
     private void CaptureKeySet(KeyboardEventArgs key)
@@ -285,31 +356,70 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
             new MenuList(
                 "VSync: " + (renderer.VSyncEnabled ? "Yes" : "No"),
                 "vsync"));
+        menuList.Add(
+            new MenuList(
+                VideoStandardText(machine.VideoStandard),
+                "videostandard"));
+        menuList.Add(
+            new MenuList(
+                "Scanlines: " + (renderer.Scanlines ? "On" : "Off"),
+                "scanlines"));
+        menuList.Add(
+            new MenuList(
+                "Fullscreen Scaling: " +
+                (renderer.FullscreenFillHeight ? "Fill Height" : "Fit"),
+                "fullscreenfill"));
         menuList.Add(new MenuList("Display Mode:", string.Empty));
+
+        // The VIC's pixels are not square, so the full border-to-border
+        // frame presents at 4:3: 377 x 284 in PAL and 314 x 235 in NTSC.
+        var frameWidth = renderer.PresentationWidth;
+        var frameHeight = renderer.PresentationHeight;
+
+        // Whole-number zooms keep the window on the picture's aspect, so
+        // the frame fills it without letterbox bars.
+        for (var scale = 1; scale <= 4; scale++)
+        {
+            menuList.Add(
+                new MenuList(
+                    $"Windowed ({frameWidth * scale} x {frameHeight * scale})",
+                    "resolution",
+                    [
+                        "window",
+                        (frameWidth * scale).ToString(),
+                        (frameHeight * scale).ToString()
+                    ],
+                    1));
+        }
+
         menuList.Add(
             new MenuList(
-                "Windowed (403 x 284)",
+                "Windowed (last size)",
                 "resolution",
-                ["window", "403", "284"],
-                1));
-        menuList.Add(
-            new MenuList(
-                "Windowed (806 x 568)",
-                "resolution",
-                ["window", "806", "568"],
+                [
+                    "window",
+                    renderer.LastWindowWidth.ToString(),
+                    renderer.LastWindowHeight.ToString()
+                ],
                 1));
 
         DisplaySize[] fullscreenModes = renderer.FullscreenModes;
-        var hasFiftyHertzMode = false;
+        var hasPreferredMode = false;
 
         foreach (DisplaySize mode in fullscreenModes)
         {
             string label;
 
-            if (mode.IsFiftyHertz)
+            if (mode.IsPreferred(machine.VideoStandard))
             {
-                hasFiftyHertzMode = true;
-                label = $"Fullscreen 50 Hz ({mode.Width} x {mode.Height})";
+                hasPreferredMode = true;
+                label = machine.VideoStandard == VideoStandard.Ntsc
+                    ? $"Fullscreen 60 Hz ({mode.Width} x {mode.Height})"
+                    : $"Fullscreen 50 Hz ({mode.Width} x {mode.Height})";
+            }
+            else if (mode.IsSixtyHertz)
+            {
+                label = $"Fullscreen 60 Hz ({mode.Width} x {mode.Height})";
             }
             else if (mode.RefreshRate > 0)
             {
@@ -335,11 +445,13 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                     1));
         }
 
-        if (!hasFiftyHertzMode)
+        if (!hasPreferredMode)
         {
             menuList.Add(
                 new MenuList(
-                    "No 50 Hz fullscreen mode available",
+                    machine.VideoStandard == VideoStandard.Ntsc
+                        ? "No 60 Hz fullscreen mode available"
+                        : "No 50 Hz fullscreen mode available",
                     string.Empty,
                     level: 1));
         }
@@ -618,7 +730,7 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
         menuList.Add(new MenuList("F10: Save diagnostic dump", string.Empty));
         menuList.Add(new MenuList("F11: Swap joysticks", string.Empty));
         menuList.Add(new MenuList("F12 / Esc: Open or close menu", string.Empty));
-        menuList.Add(new MenuList("Up / Down: Move, Page: Jump", string.Empty));
+        menuList.Add(new MenuList("Up / Down: Move (hold to repeat), Page: Jump", string.Empty));
         menuList.Add(new MenuList("Enter: Select   Space: Launch", string.Empty));
         menuList.Add(new MenuList("Left / Backspace: Go back", string.Empty));
         menuList.Add(new MenuList("Left / Right: Change a setting", string.Empty));
@@ -860,6 +972,24 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
                             ? "VSync is not supported by this display driver"
                             : "VSync could not be disabled by this display driver");
                 }
+                break;
+
+            case "videostandard":
+            case "videostandard.left":
+            case "videostandard.right":
+                ToggleVideoStandard();
+                break;
+
+            case "scanlines":
+            case "scanlines.left":
+            case "scanlines.right":
+                ToggleScanlines();
+                break;
+
+            case "fullscreenfill":
+            case "fullscreenfill.left":
+            case "fullscreenfill.right":
+                ToggleFullscreenFillHeight();
                 break;
 
             case "resolution":
@@ -1129,12 +1259,90 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
     }
 
     /// <summary>
+    /// Switches between PAL and NTSC. The machine resets so the KERNAL can
+    /// redetect the frame rate at $02A6, and the renderer rebuilds its frame
+    /// texture for the new picture height.
+    /// </summary>
+    private void ToggleVideoStandard()
+    {
+        VideoStandard next = machine.VideoStandard == VideoStandard.Pal
+            ? VideoStandard.Ntsc
+            : VideoStandard.Pal;
+
+        machine.VideoStandard = next;
+        AppSettings.Current.VideoStandard = next;
+        renderer.ApplyVideoStandard();
+        AppSettings.Current.Save();
+
+        // Rebuild the display menu so the window presets and the fullscreen
+        // modes follow the new frame size and refresh rate, keeping the
+        // highlight on the video-standard item.
+        var index = selectedItem;
+
+        LoadDisplayMenu();
+        selectedItem = Math.Min(index, menuList.Count - 1);
+        currentPosition = Math.Clamp(
+            selectedItem - (MaxItems - 1),
+            0,
+            Math.Max(0, menuList.Count - MaxItems));
+
+        renderer.DisplayStatus(
+            next == VideoStandard.Ntsc
+                ? "NTSC timing: 1022727 Hz, 59.83 Hz frames"
+                : "PAL timing: 985248 Hz, 50.13 Hz frames");
+    }
+
+    private void ToggleScanlines()
+    {
+        var enabled = !renderer.Scanlines;
+
+        renderer.SetScanlines(enabled);
+        AppSettings.Current.Save();
+        UpdateItem(
+            "scanlines",
+            "Scanlines: " + (enabled ? "On" : "Off"));
+        renderer.DisplayStatus(
+            enabled ? "Scanlines enabled" : "Scanlines disabled");
+    }
+
+    private void ToggleFullscreenFillHeight()
+    {
+        var enabled = !renderer.FullscreenFillHeight;
+
+        renderer.SetFullscreenFillHeight(enabled);
+        AppSettings.Current.Save();
+        UpdateItem(
+            "fullscreenfill",
+            "Fullscreen Scaling: " + (enabled ? "Fill Height" : "Fit"));
+        renderer.DisplayStatus(
+            enabled
+                ? "Fullscreen scales to fill the display height"
+                : "Fullscreen fits the whole picture");
+    }
+
+    private static string VideoStandardText(VideoStandard standard)
+    {
+        return standard == VideoStandard.Ntsc
+            ? "Video Standard: NTSC (60 Hz)"
+            : "Video Standard: PAL (50 Hz)";
+    }
+
+    /// <summary>
     /// Settings that answer Left and Right keep those keys instead of using
     /// them to step back out of the menu.
     /// </summary>
     private static bool ChangesWithLeftRight(string command)
     {
-        return command is "fps" or "vsync" or "audiodevice" or "volume" or "mute" or "keyboard";
+        return command is
+            "fps" or
+            "vsync" or
+            "videostandard" or
+            "scanlines" or
+            "fullscreenfill" or
+            "audiodevice" or
+            "volume" or
+            "mute" or
+            "keyboard";
     }
 
     private static string ResolveMediaDirectory()

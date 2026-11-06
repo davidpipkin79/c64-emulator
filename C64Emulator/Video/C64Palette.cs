@@ -1,13 +1,13 @@
 namespace C64Emulator.Video;
 
 /// <summary>
-/// The fixed 16-colour C64 palette. The values are a commonly used PAL
-/// approximation; they are deliberately kept separate from colour RAM so
-/// changing the palette does not alter emulated state.
+/// One 16-colour C64 palette. Palette values are host-side presentation data;
+/// colour RAM continues to store only the 4-bit colour indices.
 /// </summary>
-internal static class C64Palette
+internal sealed class C64Palette
 {
-    private static readonly RgbColor[] Colors =
+    // The emulator's existing, deliberately saturated PAL approximation.
+    public static C64Palette Pal { get; } = new(
     [
         new RgbColor(0x00, 0x00, 0x00), // 0 black
         new RgbColor(0xFF, 0xFF, 0xFF), // 1 white
@@ -25,18 +25,54 @@ internal static class C64Palette
         new RgbColor(0xAC, 0xEA, 0x88), // 13 light green
         new RgbColor(0x75, 0xA1, 0xEC), // 14 light blue
         new RgbColor(0xCA, 0xCA, 0xCA)  // 15 light grey
-    ];
+    ]);
 
-    public static RgbColor Get(int index)
+    // VICE data/C64/pepto-ntsc-sony.vpl: Pepto's NTSC calculation using the
+    // Sony CXA2025AS US decoder matrix. Real NTSC output also depended on the
+    // VIC revision and the monitor, so this is a representative table rather
+    // than a universal one.
+    public static C64Palette Ntsc { get; } = new(
+    [
+        new RgbColor(0x00, 0x00, 0x00), // 0 black
+        new RgbColor(0xFF, 0xFF, 0xFF), // 1 white
+        new RgbColor(0x7C, 0x35, 0x2B), // 2 red
+        new RgbColor(0x5A, 0xA6, 0xB1), // 3 cyan
+        new RgbColor(0x69, 0x41, 0x85), // 4 purple
+        new RgbColor(0x5D, 0x86, 0x43), // 5 green
+        new RgbColor(0x21, 0x2E, 0x78), // 6 blue
+        new RgbColor(0xCF, 0xBE, 0x6F), // 7 yellow
+        new RgbColor(0x89, 0x4A, 0x26), // 8 orange
+        new RgbColor(0x5B, 0x33, 0x00), // 9 brown
+        new RgbColor(0xAF, 0x64, 0x59), // 10 light red
+        new RgbColor(0x43, 0x43, 0x43), // 11 dark grey
+        new RgbColor(0x6B, 0x6B, 0x6B), // 12 medium grey
+        new RgbColor(0xA0, 0xCB, 0x84), // 13 light green
+        new RgbColor(0x56, 0x65, 0xB3), // 14 light blue
+        new RgbColor(0x95, 0x95, 0x95)  // 15 light grey
+    ]);
+
+    private readonly RgbColor[] colors;
+
+    private C64Palette(RgbColor[] colors)
     {
-        return Colors[index & 0x0F];
+        this.colors = colors;
     }
 
-    public static int ToIndex(RgbColor color)
+    public static C64Palette For(VideoStandard standard)
     {
-        for (var i = 0; i < Colors.Length; i++)
+        return standard == VideoStandard.Ntsc ? Ntsc : Pal;
+    }
+
+    public RgbColor Get(int index)
+    {
+        return colors[index & 0x0F];
+    }
+
+    public int ToIndex(RgbColor color)
+    {
+        for (var i = 0; i < colors.Length; i++)
         {
-            if (Colors[i] == color)
+            if (colors[i] == color)
                 return i;
         }
 

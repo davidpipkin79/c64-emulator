@@ -41,11 +41,11 @@ It is skipped gracefully when the ROM files are not present.
 | `F9` | Hold for max-speed warp; release to return to normal speed |
 | `F10` | Write a diagnostic dump to the working directory |
 | `F11` | Switch the two joystick maps |
-| `F12` | Open/close the emulator menu; **Display** sets VSync and fullscreen mode, **Audio** sets device, volume and mute |
+| `F12` | Open/close the emulator menu; **Display** sets VSync, scanlines and fullscreen mode, **Audio** sets device, volume and mute |
 | Arrow keys / numpad | Default joystick key sets |
 | `Esc` in a menu | Return to the emulator |
 | `Left` / `Backspace` in a menu | Go back one level: parent folder, previous menu, or out of a disk or tape list |
-| `Up` / `Down`, `Page Up` / `Page Down` | Move through the menu |
+| `Up` / `Down`, `Page Up` / `Page Down` | Move through the menu; hold Up/Down to repeat |
 | `Enter` in a menu | Select the highlighted item |
 | `Space` on a media file | Load and start the highlighted PRG, D64, T64, TAP or CRT |
 
@@ -80,16 +80,27 @@ settings file as the display, input and network preferences, so they survive a
 restart. Device selection uses the SDL playback-device list and falls back to
 the system default if the saved device is no longer present.
 
-The **Display** menu has a persisted VSync toggle. Fullscreen modes are listed
-with their refresh rate, and modes at 50 Hz are listed first so a PAL C64
-(50.125 fps) can run on a matching display cadence. The selected resolution and
-refresh rate are restored on the next launch. If SDL reports no 50 Hz mode, the
-menu says so; 50 Hz support depends on the monitor and graphics driver.
+The **Display** menu has persisted VSync and scanline toggles and a
+**Video Standard** entry that switches between PAL (the default) and NTSC.
+Scanlines are off by default and only affect the host presentation; they do
+not change the VIC frame, save states, screenshots or network frames. Menus
+longer than the visible rows show a proportional scrollbar inside the right
+edge of the display area, with long labels clipped before it. Fullscreen modes
+are listed with their refresh rate, and modes matching the active standard are
+listed first: 50 Hz for PAL (50.125 fps) and 60 Hz for NTSC (59.826 fps). The
+selected resolution and refresh rate are restored on the next launch. PAL and
+NTSC each remember their own windowed size, so switching back to a standard
+restores the window it was last shown in; a **Windowed (last size)** entry
+returns to that size directly. The presets use the C64's 4:3 presentation:
+377 x 284 in PAL and 314 x 235 in NTSC at 1x. Fullscreen keeps that aspect,
+so a widescreen display shows side bars instead of a stretched picture.
+If SDL reports no matching mode, the menu says so; that support depends on
+the monitor and graphics driver.
 
-With VSync disabled, the host presents at the emulated 50.125 fps cadence
-instead of using a fixed 10 ms loop, avoiding duplicate frame submissions.
-Holding `F9` runs the machine uncapped; releasing it returns to the normal
-50.125 fps cadence. The VIC and SID keep running during warp, so the picture
+With VSync disabled, the host presents at the emulated frame cadence of the
+active standard instead of using a fixed 10 ms loop, avoiding duplicate frame
+submissions. Holding `F9` runs the machine uncapped; releasing it returns to
+the standard's normal cadence. The VIC and SID keep running during warp, so the picture
 and audio remain live while the CPU and 1541 use the host's full speed. The
 host redraws at 30 Hz while warping and flushes the audio buffer when warp is
 released.
@@ -246,9 +257,9 @@ Important boundaries:
   VCBASE advances when an eight-scanline character row completes rather than on
   every badline, so raster splits that place badlines closer than eight lines
   keep the current row instead of jumping to an adjacent matrix row.
-  The PAL raster counter uses the 62/63/64-cycle line pattern, raises raster
-  IRQs on cycle 1 of the matching line, and reports the previous line at cycle
-  0 of line 0.
+  The PAL raster counter uses the 62/63/64-cycle line pattern, while NTSC uses
+  65-cycle lines throughout; both raise raster IRQs on cycle 1 of the matching
+  line and report the previous line at cycle 0 of line 0.
 - Two 6526 CIA timers, ICR behavior, TOD clock (BCD and latching), keyboard
   matrix and both joystick ports.
 - SID audio: three 24-bit oscillator voices with triangle, sawtooth, pulse,
@@ -268,9 +279,9 @@ Important boundaries:
   hot keys and menu entries.
 - Standard 8K/16K CRT cartridges, including the `$8000`/`$A000` ROM overlay and
   a menu-driven mount/eject path.
-- SDL3 window, integer scaling, VSync control, refresh-rate-aware fullscreen
-  modes (including 50 Hz PAL modes), embedded C64 font, FPS/status overlay and a
-  text menu.
+- SDL3 window, aspect-correct scaling, VSync control, optional scanlines,
+  refresh-rate-aware fullscreen modes (including 50 Hz PAL modes), embedded
+  C64 font, FPS/status overlay and a text menu.
 - Host/client screen and input transport on port `6464`.
 
 The SID is clocked by the same PAL CPU cycles as the rest of the machine, and
@@ -308,7 +319,7 @@ These are deliberately not presented as complete:
   Each one advances the machine one cycle, and BA/AEC is checked at the access
   itself, so contention lands on the real cycle inside an instruction rather
   than at its boundary. The SID is clocked per cycle for the same reason.
-- The VIC follows the PAL 6569 access table: the 40 c-accesses (video matrix
+- The VIC follows the 6569/6567 access table: the 40 c-accesses (video matrix
   and Color RAM) run on cycles 15-54 in the VIC's second phase, the matching
   g-accesses follow on 16-55, and the fetched byte reaches the screen twelve
   pixels later from the shift-register stage. Sprite pointers and the three
@@ -322,7 +333,23 @@ These are deliberately not presented as complete:
   unstable opcodes are not cycle-accurate.
 - The network protocol is the emulator's own host/client protocol, not a
   general remote-desktop protocol. It is plain TCP and has no authentication.
-- PAL timing is used (`985248 Hz`, 50.125 Hz frames); NTSC is not selectable.
+- PAL is the default timing (`985248 Hz`, 50.125 Hz frames, 312 raster lines
+  of 63 cycles). The Display menu switches to NTSC (`1022727 Hz`, 59.826 Hz
+  frames, 263 raster lines of 65 cycles); the VIC geometry, SID clock, CIA
+  time-of-day rate and 1541 speed ratio follow the selected standard, and the
+  machine resets so the KERNAL redetects the frame rate at `$02A6`. The
+  native VIC frames are 403 x 284 in PAL and 418 x 235 in NTSC, and the
+  frame buffer, texture and network frames follow that size. The pixels are
+  not square, so the host presents the border-to-border frame at 4:3:
+  377 x 284 in PAL and 314 x 235 in NTSC. Windowed presets are whole-number
+  zooms of that aspect-corrected frame, so the picture fills the window
+  without letterbox bars. Fullscreen preserves 4:3; Fill Height is the
+  default and uses the display height, leaving side bars on wider screens.
+  Fit shows the complete frame, and Fill Height crops the sides only on
+  displays narrower than 4:3. The active standard also selects its colour
+  table: PAL keeps the existing approximation, while NTSC uses Pepto's Sony
+  CXA2025AS NTSC palette. Colour RAM and network frames still carry 4-bit
+  indices, so the palette remains a host-side presentation choice.
 - Save states are versioned to the current snapshot format and are rejected by
   other build versions. Rewind history is memory-only and is cleared by a
   reset, program load or media change. Disk, tape and cartridge images are

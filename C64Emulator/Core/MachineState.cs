@@ -18,7 +18,9 @@ internal static class MachineState
 {
     // "C64S" in little-endian byte order.
     private const uint Magic = 0x53343643;
-    private const int Version = 1;
+
+    // Version 2 added the video standard after the frame-cycle count.
+    private const int Version = 2;
 
     private const BindingFlags FieldFlags =
         BindingFlags.Instance |
@@ -36,6 +38,7 @@ internal static class MachineState
         writer.Write(Magic);
         writer.Write(Version);
         writer.Write(machine.FrameCycles);
+        writer.Write((int)machine.VideoStandard);
 
         StateSerializer.WriteString(writer, machine.Drive.ImagePath);
         StateSerializer.WriteString(writer, machine.Tape.ImagePath);
@@ -81,13 +84,28 @@ internal static class MachineState
 
         int version = reader.ReadInt32();
 
-        if (version != Version)
+        if (version < 1 || version > Version)
         {
             throw new InvalidDataException(
-                $"Unsupported save-state version {version} (expected {Version}).");
+                $"Unsupported save-state version {version} (expected 1 to {Version}).");
         }
 
         int frameCycles = reader.ReadInt32();
+
+        // Version 1 states were always written in PAL mode.
+        VideoStandard standard = version == 1
+            ? VideoStandard.Pal
+            : machine.VideoStandard;
+
+        if (version >= 2)
+        {
+            int stored = reader.ReadInt32();
+
+            if (Enum.IsDefined(typeof(VideoStandard), stored))
+                standard = (VideoStandard)stored;
+        }
+
+        machine.SetVideoStandard(standard, reset: false);
         string? diskPath = StateSerializer.ReadString(reader);
         string? tapePath = StateSerializer.ReadString(reader);
         string? cartridgePath = StateSerializer.ReadString(reader);

@@ -34,6 +34,7 @@ internal sealed class EmuWin
     private bool ttfInitialized;
     private volatile bool shuttingDown;
     private volatile bool clientScreenReady;
+    private volatile bool videoStandardChanged;
     private bool f9Held;
 
     public void Start()
@@ -70,6 +71,7 @@ internal sealed class EmuWin
             machine = new C64Machine(RomSet.Load(AppContext.BaseDirectory));
             SoundTrace.AttachFromEnvironment(machine);
             machine.TrueDriveEmulation = AppSettings.Current.TrueDriveEmulation;
+            machine.VideoStandard = AppSettings.Current.VideoStandard;
             machine.Sid.OutputVolume = AppSettings.Current.AudioVolume;
             machine.Sid.Muted = AppSettings.Current.AudioMuted;
             renderer = new Renderer(machine);
@@ -123,6 +125,12 @@ internal sealed class EmuWin
             if (!running)
                 break;
 
+            if (videoStandardChanged)
+            {
+                videoStandardChanged = false;
+                renderer?.ApplyVideoStandard();
+            }
+
             var frameReady = machine?.ConsumeFrameReady() ?? false;
 
             if (clientScreenReady)
@@ -168,6 +176,8 @@ internal sealed class EmuWin
                 continue;
             }
 
+            menu?.Update();
+
             // Present each completed frame once, immediately. Waiting for
             // a separate timer submitted duplicate frames and added up to
             // several milliseconds of delay jitter, which shows up as an
@@ -187,7 +197,7 @@ internal sealed class EmuWin
             {
                 renderer.Present();
                 nextPresent =
-                    Stopwatch.GetTimestamp() + C64Machine.FrameDurationTicks;
+                    Stopwatch.GetTimestamp() + machine!.FrameDurationTicks;
             }
             else
             {
@@ -208,7 +218,14 @@ internal sealed class EmuWin
             return;
         }
 
-        network.Send(NetworkCommand.Image, machine.Vic.CapturePackedScreen());
+        // Lead the frame with the video standard so clients can resize to
+        // the host's picture before decoding the pixels.
+        var packed = machine.Vic.CapturePackedScreen();
+        var payload = new byte[packed.Length + 1];
+        payload[0] = (byte)machine.VideoStandard;
+        packed.CopyTo(payload, 1);
+
+        network.Send(NetworkCommand.Image, payload);
     }
 
     private void HandleEvent(SDL.Event sdlEvent)
@@ -222,6 +239,7 @@ internal sealed class EmuWin
 
             case SDL.EventType.WindowFocusLost:
                 ReleaseWarp();
+                menu?.ResetNavigation();
                 break;
 
             case SDL.EventType.KeyDown:
@@ -466,6 +484,10 @@ internal sealed class EmuWin
         if (shuttingDown || machine is null)
             return;
 
+        machine.SetVideoStandard(
+            AppSettings.Current.VideoStandard,
+            reset: false);
+        videoStandardChanged = true;
         machine.HardReset();
         machine.Start();
         renderer?.DisplayStatus("Disconnected");
@@ -483,7 +505,24 @@ internal sealed class EmuWin
 
     private void NetworkScreenDataReceived(byte[] data)
     {
-        machine?.Vic.SetPackedScreen(data);
+        if (machine is null || data.Length < 2)
+            return;
+
+        var standard = (VideoStandard)data[0];
+
+        if (standard is not (VideoStandard.Pal or VideoStandard.Ntsc))
+            return;
+
+        if (machine.Vic.VideoStandard != standard)
+        {
+            machine.SetVideoStandard(standard, reset: false);
+
+            // The renderer owns SDL state, so the host loop applies the
+            // new texture size instead of this network callback.
+            videoStandardChanged = true;
+        }
+
+        machine.Vic.SetPackedScreen(data[1..]);
         clientScreenReady = true;
     }
 
@@ -645,7 +684,10 @@ internal sealed class EmuWin
                 Read(machine, pixelBase, 8000));
             WriteBmp(
                 Path.Combine(directory, "live-state.bmp"),
-                vic.CapturePackedScreen());
+                vic.CapturePackedScreen(),
+                vic.VisibleWidth,
+                vic.VisibleHeight,
+                C64Palette.For(vic.VideoStandard));
             renderer?.DisplayStatus("Diagnostic captured (live-state)");
         }
         catch (Exception exception)
@@ -684,10 +726,13 @@ internal sealed class EmuWin
         return string.Concat(values);
     }
 
-    private static void WriteBmp(string path, byte[] packed)
+    private static void WriteBmp(
+        string path,
+        byte[] packed,
+        int width,
+        int height,
+        C64Palette palette)
     {
-        const int width = Vic.VisibleWidth;
-        const int height = Vic.VisibleHeight;
         var stride = (width * 3 + 3) & ~3;
 
         using FileStream stream = File.Create(path);
@@ -719,7 +764,7 @@ internal sealed class EmuWin
                 var pixel = y * width + x;
                 var value = packed[pixel / 2];
                 var colorIndex = (pixel & 1) == 0 ? value >> 4 : value & 0x0F;
-                RgbColor color = C64Palette.Get(colorIndex);
+                RgbColor color = palette.Get(colorIndex);
                 writer.Write(color.B);
                 writer.Write(color.G);
                 writer.Write(color.R);

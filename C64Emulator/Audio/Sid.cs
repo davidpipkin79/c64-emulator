@@ -14,8 +14,7 @@ internal sealed class Sid
     public const int RegisterCount = 29;
     public const int SampleRate = 48000;
 
-    private const int ClockHz = 985248;
-    private const double CyclesPerSample = (double)ClockHz / SampleRate;
+    private const int DefaultClockHz = 985_248;
     private const double PhasePeriod = 1 << 24;
     private const int QueueCapacity = 16384;
     private const int ScratchCapacity = 64;
@@ -49,6 +48,10 @@ internal sealed class Sid
     private int queueTail;
     private int queueCount;
     private double sampleAccumulator;
+
+    [System.NonSerialized] private int clockFrequency = DefaultClockHz;
+    [System.NonSerialized] private double cyclesPerSample =
+        (double)DefaultClockHz / SampleRate;
     private volatile int outputVolume = 100;
     private volatile bool muted;
 
@@ -71,6 +74,23 @@ internal sealed class Sid
     {
         get => muted;
         set => muted = value;
+    }
+
+    /// <summary>
+    /// CPU clock driving the phase accumulators. An NTSC SID runs at
+    /// 1.0227 MHz, which raises every voice by 3.8% if it is not applied.
+    /// </summary>
+    public int ClockFrequency
+    {
+        get => clockFrequency;
+        set
+        {
+            if (value <= 0 || value == clockFrequency)
+                return;
+
+            clockFrequency = value;
+            cyclesPerSample = (double)value / SampleRate;
+        }
     }
 
     /// <summary>
@@ -132,9 +152,9 @@ internal sealed class Sid
 
         var generated = 0;
 
-        while (sampleAccumulator >= CyclesPerSample)
+        while (sampleAccumulator >= cyclesPerSample)
         {
-            sampleAccumulator -= CyclesPerSample;
+            sampleAccumulator -= cyclesPerSample;
             scratch[generated++] = GenerateSample();
 
             if (generated == scratch.Length)
@@ -349,7 +369,7 @@ internal sealed class Sid
                 continue;
             }
 
-            voice.Phase += voice.Frequency * CyclesPerSample;
+            voice.Phase += voice.Frequency * cyclesPerSample;
             voice.Wrapped = voice.Phase >= PhasePeriod;
 
             if (voice.Wrapped)

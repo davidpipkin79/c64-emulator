@@ -17,6 +17,9 @@ internal sealed class Drive1541
     public const int RomSize = 16384;
     private const int ClockHz = 1_000_000;
 
+    [System.NonSerialized]
+    private int c64ClockHz = C64Machine.PalClockHz;
+
     // The host checks for the ATN acknowledge about 1 ms after asserting
     // ATN, so the acknowledge must not be released before that even when
     // the DOS is idle and switches to input immediately.
@@ -134,6 +137,17 @@ internal sealed class Drive1541
     }
 
     /// <summary>
+    /// Sets the C64 clock used to convert host cycles into the drive's own
+    /// 1 MHz clock. An NTSC machine runs slightly faster, so the 1541 only
+    /// keeps its real speed ratio when this follows the active standard.
+    /// </summary>
+    public void SetC64Clock(int hz)
+    {
+        if (hz > 0)
+            c64ClockHz = hz;
+    }
+
+    /// <summary>
     /// Advances the drive by the number of C64 cycles just executed. The
     /// 1541's 6502 runs at a slightly different clock, so a fractional
     /// accumulator keeps the two machines in step over time.
@@ -144,9 +158,9 @@ internal sealed class Drive1541
             return;
 
         accumulator += (long)c64Cycles * ClockHz;
-        var driveCycles = accumulator / C64Machine.ClockHz;
+        var driveCycles = accumulator / c64ClockHz;
 
-        accumulator %= C64Machine.ClockHz;
+        accumulator %= c64ClockHz;
         budget += driveCycles;
 
         while (budget > 0)

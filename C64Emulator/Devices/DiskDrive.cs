@@ -104,6 +104,11 @@ internal sealed class DiskDrive
         RealDrive?.Reset();
     }
 
+    public void SetC64Clock(int hz)
+    {
+        RealDrive?.SetC64Clock(hz);
+    }
+
     public void Tick(int cycles)
     {
         RealDrive?.Tick(cycles);

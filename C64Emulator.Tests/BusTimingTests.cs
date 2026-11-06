@@ -41,7 +41,7 @@ public sealed class BusTimingTests : IDisposable
     public void BadlineLeadInStallsAnInstructionFetchRead()
     {
         machine.Vic.SetRegister(0x11, 0x1B); // DEN, 25 rows, YSCROLL 3
-        machine.Vic.Tick(Vic.CyclesPerFrame);
+        machine.Vic.Tick(machine.Vic.FrameCycles);
         TickToCycle(machine.Vic, 51, 12);
 
         WriteProgram(0xA9, 0x01); // LDA #$01
@@ -61,7 +61,7 @@ public sealed class BusTimingTests : IDisposable
         machine.Vic.SetRegister(0x11, 0x18); // DEN, 25 rows, YSCROLL 0
         machine.Vic.SetRegister(0x15, 0x01); // sprite 0
         machine.Vic.SetRegister(0x01, 50);   // starts on raster 51
-        machine.Vic.Tick(Vic.CyclesPerFrame);
+        machine.Vic.Tick(machine.Vic.FrameCycles);
         TickToCycle(machine.Vic, 51, 51);
 
         machine.Cpu.A = 0x42;
@@ -76,6 +76,20 @@ public sealed class BusTimingTests : IDisposable
         Assert.Equal(55, machine.Vic.RasterCycle);
     }
 
+    [Fact]
+    public void SwitchingToNtscUpdatesMachineClocksAndFrameLength()
+    {
+        machine.VideoStandard = VideoStandard.Ntsc;
+
+        Assert.Equal(VideoStandard.Ntsc, machine.VideoStandard);
+        Assert.Equal(1_022_727, machine.ClockFrequency);
+        Assert.Equal(17_095, machine.CyclesPerFrame);
+        Assert.Equal(1_022_727, machine.Sid.ClockFrequency);
+        Assert.Equal(102_272, machine.Cia1.TodClockFrequency);
+        Assert.Equal(235, machine.Vic.VisibleHeight);
+        Assert.Equal(1_022_727, machine.Vic.ClockHz);
+    }
+
     private void WriteProgram(params byte[] code)
     {
         const ushort start = 0x0200;
@@ -88,7 +102,7 @@ public sealed class BusTimingTests : IDisposable
 
     private static void TickToCycle(Vic vic, int line, int cycle)
     {
-        for (var i = 0; i < Vic.CyclesPerFrame; i++)
+        for (var i = 0; i < vic.FrameCycles; i++)
         {
             if (vic.RasterLine == line && vic.RasterCycle == cycle)
                 return;

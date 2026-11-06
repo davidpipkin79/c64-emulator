@@ -78,7 +78,7 @@ public sealed class Drive1541Tests
 
         Assert.Equal(0xEAA0, drive.Cpu.GetPC());
 
-        drive.Tick(C64Machine.ClockHz * 3);
+        drive.Tick(C64Machine.PalClockHz * 3);
 
         var pc = drive.Cpu.GetPC();
 
@@ -103,7 +103,7 @@ public sealed class Drive1541Tests
         IecBus bus = new IecBus();
         Drive1541 drive = new Drive1541(File.ReadAllBytes(romPath), bus);
 
-        drive.Tick(C64Machine.ClockHz * 3);
+        drive.Tick(C64Machine.PalClockHz * 3);
 
         bus.SetC64(0x08, 0x3C);
 
@@ -150,7 +150,7 @@ public sealed class Drive1541Tests
         IecBus bus = new IecBus();
         Drive1541 drive = new Drive1541(File.ReadAllBytes(romPath), bus);
 
-        drive.Tick(C64Machine.ClockHz * 3);
+        drive.Tick(C64Machine.PalClockHz * 3);
 
         // The host asserts ATN and pulls CLK low to start a command.
         bus.SetC64(0x18, 0x3C);
@@ -255,7 +255,7 @@ public sealed class Drive1541Tests
 
         drive.Mount(image, null);
         drive.Reset();
-        drive.Tick(C64Machine.ClockHz);
+        drive.Tick(C64Machine.PalClockHz);
 
         // Job 0: seek to track 18.
         drive.Ram[0x06] = 18;

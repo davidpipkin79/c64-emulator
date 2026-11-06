@@ -205,7 +205,7 @@ public sealed class TrueDriveMatrixProbe(ITestOutputHelper output)
 
         for (var second = 0; second < 30; second++)
         {
-            machine.RunCycles(C64Machine.ClockHz);
+            machine.RunCycles(C64Machine.PalClockHz);
             output.WriteLine(
                 $"t={second + 1} PC={machine.Cpu.GetPC():X4} " +
                 $"JAM={machine.Cpu.IsJammed} DRVPC={drive.Cpu.GetPC():X4} " +
@@ -249,7 +249,7 @@ public sealed class TrueDriveMatrixProbe(ITestOutputHelper output)
 
         for (var second = 0; second < 30; second++)
         {
-            machine.RunCycles(C64Machine.ClockHz);
+            machine.RunCycles(C64Machine.PalClockHz);
             output.WriteLine(
                 $"t={second + 1} PC={machine.Cpu.GetPC():X4} " +
                 $"S={machine.Cpu.S:X2} JAM={machine.Cpu.IsJammed} " +
@@ -292,7 +292,7 @@ public sealed class TrueDriveMatrixProbe(ITestOutputHelper output)
 
         for (var second = 0; second < 30; second++)
         {
-            machine.RunCycles(C64Machine.ClockHz);
+            machine.RunCycles(C64Machine.PalClockHz);
             output.WriteLine(
                 $"t={second + 1} PC={machine.Cpu.GetPC():X4} " +
                 $"JAM={machine.Cpu.IsJammed} DRVPC={drive.Cpu.GetPC():X4} " +
@@ -541,7 +541,7 @@ public sealed class TrueDriveMatrixProbe(ITestOutputHelper output)
 
         for (var second = 0; second < 12; second++)
         {
-            machine.RunCycles(C64Machine.ClockHz);
+            machine.RunCycles(C64Machine.PalClockHz);
             output.WriteLine(
                 $"t={second + 1} C64PC={machine.Cpu.GetPC():X4} " +
                 $"C1={machine.Memory.Peek(0xC1):X2} C2={machine.Memory.Peek(0xC2):X2} " +
@@ -610,7 +610,7 @@ public sealed class TrueDriveMatrixProbe(ITestOutputHelper output)
 
         for (var second = 1; second <= 260; second++)
         {
-            machine.RunCycles(C64Machine.ClockHz);
+            machine.RunCycles(C64Machine.PalClockHz);
 
             var shadow = string.Concat(
                 Enumerable.Range(0, 24).Select(
@@ -775,7 +775,7 @@ public sealed class TrueDriveMatrixProbe(ITestOutputHelper output)
 
         for (var second = 0; second < 12; second++)
         {
-            machine.RunCycles(C64Machine.ClockHz);
+            machine.RunCycles(C64Machine.PalClockHz);
             output.WriteLine(
                 $"t={second + 1} C64PC={machine.Cpu.GetPC():X4} " +
                 $"C1={machine.Memory.Peek(0xC1):X2} C2={machine.Memory.Peek(0xC2):X2} " +

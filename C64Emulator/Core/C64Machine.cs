@@ -20,13 +20,10 @@ namespace C64Emulator.Core;
 /// </summary>
 internal sealed class C64Machine : IDisposable
 {
-    // PAL C64: 985248 Hz CPU clock, 50.125 frames per second. A frame is
-    // 19.95 ms, not the 20 ms a 50 Hz approximation would give.
-    public const int ClockHz = 985248;
-    public const int CyclesPerFrame = 19656;
-
-    private static readonly long FrameTicks =
-        Stopwatch.Frequency * 1995 / 100_000;
+    // PAL C64 defaults: 985248 Hz CPU clock, 50.125 frames per second. The
+    // active standard is switchable at runtime; see VideoStandard.
+    public const int PalClockHz = 985248;
+    public const int PalCyclesPerFrame = 19656;
 
     static C64Machine()
     {
@@ -66,10 +63,16 @@ internal sealed class C64Machine : IDisposable
     private static bool precisionTimerCreated;
 
     /// <summary>
-    /// Duration of one PAL frame in Stopwatch ticks. Host presentation can
-    /// use this when VSync is disabled.
+    /// Duration of one frame in Stopwatch ticks for the active standard.
+    /// Host presentation can use this when VSync is disabled.
     /// </summary>
-    public static long FrameDurationTicks => FrameTicks;
+    public long FrameDurationTicks => frameDurationTicks;
+
+    /// <summary>CPU clock of the active video standard.</summary>
+    public int ClockFrequency => Vic.ClockHz;
+
+    /// <summary>Total CPU cycles in one frame of the active standard.</summary>
+    public int CyclesPerFrame => Vic.FrameCycles;
 
     private readonly ManualResetEventSlim pauseGate = new ManualResetEventSlim(true);
     private readonly ManualResetEventSlim pauseAcknowledged = new(false);
@@ -84,6 +87,7 @@ internal sealed class C64Machine : IDisposable
     private volatile bool fastForward;
     private volatile bool running;
     private int speedPercentage = 100;
+    private long frameDurationTicks = VideoTiming.Pal.FrameTicks;
     private int frameReady;
     private int frameCycles;
     private long nextWarpRender;
@@ -129,6 +133,10 @@ internal sealed class C64Machine : IDisposable
         Memory.ProcessorPortWritten = OnProcessorPortWritten;
         Io = new IoController(Vic, Sid, ColorRam, Cia1, Cia2);
         Memory.Configure(roms, Io);
+        Sid.ClockFrequency = Vic.ClockHz;
+        Cia1.TodClockFrequency = Vic.ClockHz;
+        Cia2.TodClockFrequency = Vic.ClockHz;
+        Drive.SetC64Clock(Vic.ClockHz);
         cpuBusClock = new CpuBusClock(this);
         Cpu = new Cpu6510(
             new ClockedCpuBus(Memory, cpuBusClock),
@@ -225,6 +233,44 @@ internal sealed class C64Machine : IDisposable
     }
 
     public int SpeedPercentage => Volatile.Read(ref speedPercentage);
+
+    /// <summary>
+    /// Active video system. Switching reconfigures the VIC geometry, the SID
+    /// and CIA clocks and the 1541 speed ratio, then resets the machine so
+    /// the KERNAL can redetect the frame rate at $02A6.
+    /// </summary>
+    public VideoStandard VideoStandard
+    {
+        get => Vic.VideoStandard;
+        set => SetVideoStandard(value, reset: true);
+    }
+
+    internal void SetVideoStandard(VideoStandard standard, bool reset)
+    {
+        if (Vic.VideoStandard == standard)
+            return;
+
+        var wasPaused = Paused;
+
+        WithPaused(() =>
+        {
+            Vic.SetVideoStandard(standard);
+            Sid.ClockFrequency = Vic.ClockHz;
+            Cia1.TodClockFrequency = Vic.ClockHz;
+            Cia2.TodClockFrequency = Vic.ClockHz;
+            Drive.SetC64Clock(Vic.ClockHz);
+            frameDurationTicks = Vic.FrameTicks;
+            frameCycles = 0;
+        });
+
+        if (!reset)
+            return;
+
+        HardReset();
+
+        if (wasPaused)
+            Paused = true;
+    }
 
     internal int FrameCycles
     {
@@ -1462,7 +1508,7 @@ internal sealed class C64Machine : IDisposable
     private void Run()
     {
         var last = Stopwatch.GetTimestamp();
-        var target = last + FrameTicks;
+        var target = last + frameDurationTicks;
 
         while (!stopRequested)
         {
@@ -1475,7 +1521,7 @@ internal sealed class C64Machine : IDisposable
                 pauseGate.Wait();
                 pauseAcknowledged.Reset();
                 last = Stopwatch.GetTimestamp();
-                target = last + FrameTicks;
+                target = last + frameDurationTicks;
                 continue;
             }
 
@@ -1497,7 +1543,7 @@ internal sealed class C64Machine : IDisposable
 
             var now = Stopwatch.GetTimestamp();
             var measured = (int)Math.Round(
-                FrameTicks * 100.0 / Math.Max(now - last, 1));
+                frameDurationTicks * 100.0 / Math.Max(now - last, 1));
 
             Volatile.Write(ref speedPercentage, measured);
             last = now;
@@ -1506,7 +1552,7 @@ internal sealed class C64Machine : IDisposable
             {
                 // Warp is unpaced; do not accumulate a deadline that
                 // would have to be waited out when the key is released.
-                target = now + FrameTicks;
+                target = now + frameDurationTicks;
             }
             else
             {
@@ -1514,12 +1560,12 @@ internal sealed class C64Machine : IDisposable
                 // time after every wake-up turned each late wake-up into
                 // a permanently slower cadence, which made PAL music play
                 // flat and slow.
-                target += FrameTicks;
+                target += frameDurationTicks;
 
                 // A long host stall (debugger, sleep) must not produce a
                 // burst of catch-up frames.
-                if (now - target > FrameTicks)
-                    target = now + FrameTicks;
+                if (now - target > frameDurationTicks)
+                    target = now + frameDurationTicks;
             }
 
             frameCycles -= CyclesPerFrame;

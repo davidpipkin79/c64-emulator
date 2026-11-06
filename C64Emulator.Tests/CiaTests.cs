@@ -82,7 +82,7 @@ public sealed class CiaTests : IDisposable
         cia.Poke(0x08, 0x09); // writing tenths restarts it
 
         Assert.Equal(0x92, cia.Peek(0x0B));
-        cia.ProcessTimers(98500);
+        cia.ProcessTimers(98524);
 
         Assert.Equal(0x59, cia.Peek(0x0A));
         Assert.Equal(0x59, cia.Peek(0x09));
@@ -105,13 +105,13 @@ public sealed class CiaTests : IDisposable
         cia.Poke(0x0A, 0x10);
         cia.Poke(0x0B, 0x91); // 11 PM; hours write halts TOD
 
-        cia.ProcessTimers(98500 * 2);
+        cia.ProcessTimers(98524 * 2);
 
         Assert.Equal(0x30, cia.Peek(0x09));
         Assert.Equal(0x10, cia.Peek(0x0A));
 
         cia.Poke(0x08, 0x00); // restart
-        cia.ProcessTimers(98500 * 10);
+        cia.ProcessTimers(98524 * 10);
 
         Assert.Equal(0x31, cia.Peek(0x09));
     }
@@ -164,7 +164,7 @@ public sealed class CiaTests : IDisposable
         cia.Poke(0x0B, 0x91); // 11 PM, stops the clock
         cia.Poke(0x08, 0x09); // restart at 23:59:59.9
 
-        cia.ProcessTimers(98500);
+        cia.ProcessTimers(98524);
 
         Assert.Equal(0x00, cia.Peek(0x08));
         Assert.Equal(0x00, cia.Peek(0x09));
