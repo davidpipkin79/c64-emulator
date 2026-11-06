@@ -35,9 +35,9 @@ It is skipped gracefully when the ROM files are not present.
 
 | Input | Action |
 | --- | --- |
-| `F5` | Save the quick state |
-| `F6` | Rewind one snapshot step |
-| `F7` | Load the quick state |
+| `Alt+F5` | Save the quick state |
+| `Alt+F6` | Rewind one snapshot step |
+| `Alt+F7` | Load the quick state |
 | `F9` | Hold for max-speed warp; release to return to normal speed |
 | `F10` | Write a diagnostic dump to the working directory |
 | `F11` | Switch the two joystick maps |
@@ -54,15 +54,16 @@ including the ones below.
 
 ## Save states and rewind
 
-`F5` saves a complete machine snapshot to `savestate.c64state` beside the
-executable, and `F7` loads it. The main menu also has **Save State** and
-**Load State** entries. The snapshot covers CPU registers and RAM, Color RAM,
+`Alt+F5` saves a complete machine snapshot to `savestate.c64state` beside the
+executable, and `Alt+F7` loads it. The main menu also has **Save State** and
+**Load State** entries. Plain `F5`-`F7` are passed through to the emulated
+C64 keyboard. The snapshot covers CPU registers and RAM, Color RAM,
 the VIC, SID, both CIAs, the IEC bus, the virtual disk/tape mounts and the
 optional hardware 1541. The VIC framebuffer and the host audio queue are not
 stored; they are cleared and rebuilt after a restore.
 
 The machine pauses while a snapshot is written or read, so a state always
-lands between CPU instructions. `F6` (or **Rewind** in the menu) steps back
+lands between CPU instructions. `Alt+F6` (or **Rewind** in the menu) steps back
 through an in-memory ring of snapshots taken every six frames while running at
 normal speed. The buffer holds 60 snapshots, roughly seven seconds of history.
 It is cleared by a reset, a program load, a true-drive toggle or a media mount

@@ -36,6 +36,7 @@ internal sealed class EmuWin
     private volatile bool clientScreenReady;
     private volatile bool videoStandardChanged;
     private bool f9Held;
+    private readonly HashSet<Key> activeAltHotkeys = [];
 
     public void Start()
     {
@@ -240,6 +241,7 @@ internal sealed class EmuWin
             case SDL.EventType.WindowFocusLost:
                 ReleaseWarp();
                 menu?.ResetNavigation();
+                activeAltHotkeys.Clear();
                 break;
 
             case SDL.EventType.KeyDown:
@@ -775,28 +777,57 @@ internal sealed class EmuWin
         }
     }
 
+    /// <summary>
+    /// Saves, rewinds and loads only with Alt held, so the plain C64 function
+    /// keys F5-F7 remain available to emulated software. Keep the key marked
+    /// until release so releasing Alt first cannot leak the key-up event.
+    /// </summary>
+    private bool HandleAltHotkey(KeyboardEventArgs key)
+    {
+        if (key.Key is not (Key.F5 or Key.F6 or Key.F7))
+            return false;
+
+        if (activeAltHotkeys.Contains(key.Key))
+        {
+            if (!key.Down)
+                activeAltHotkeys.Remove(key.Key);
+
+            return true;
+        }
+
+        if (!key.Down || (key.Mod & ModifierKeys.Alt) == 0)
+            return false;
+
+        activeAltHotkeys.Add(key.Key);
+
+        switch (key.Key)
+        {
+            case Key.F5:
+                SaveStateHotkey();
+                break;
+
+            case Key.F6:
+                RewindHotkey();
+                break;
+
+            case Key.F7:
+                LoadStateHotkey();
+                break;
+        }
+
+        return true;
+    }
+
     private void ProcessKey(KeyboardEventArgs key)
     {
         if (machine is null || renderer is null || network is null)
             return;
 
+        if (HandleAltHotkey(key))
+            return;
+
         switch (key.Key)
         {
-            case Key.F5:
-                if (key.Down)
-                    SaveStateHotkey();
-                return;
-
-            case Key.F6:
-                if (key.Down)
-                    RewindHotkey();
-                return;
-
-            case Key.F7:
-                if (key.Down)
-                    LoadStateHotkey();
-                return;
-
             case Key.F9:
                 if (key.Down)
                 {

@@ -723,17 +723,23 @@ internal sealed class Menu(Renderer renderer, C64Machine machine, Network networ
         backTarget = "main";
 
         menuList.Add(new MenuList("Back to Main Menu", "main"));
-        menuList.Add(new MenuList("F5: Save quick state", string.Empty));
-        menuList.Add(new MenuList("F6: Rewind one step", string.Empty));
-        menuList.Add(new MenuList("F7: Load quick state", string.Empty));
+        menuList.Add(new MenuList("Alt+F5: Save quick state", string.Empty));
+        menuList.Add(new MenuList("Alt+F6: Rewind one step", string.Empty));
+        menuList.Add(new MenuList("Alt+F7: Load quick state", string.Empty));
         menuList.Add(new MenuList("F9 (hold): Warp / fast forward", string.Empty));
         menuList.Add(new MenuList("F10: Save diagnostic dump", string.Empty));
         menuList.Add(new MenuList("F11: Swap joysticks", string.Empty));
-        menuList.Add(new MenuList("F12 / Esc: Open or close menu", string.Empty));
-        menuList.Add(new MenuList("Up / Down: Move (hold to repeat), Page: Jump", string.Empty));
-        menuList.Add(new MenuList("Enter: Select   Space: Launch", string.Empty));
-        menuList.Add(new MenuList("Left / Backspace: Go back", string.Empty));
-        menuList.Add(new MenuList("Left / Right: Change a setting", string.Empty));
+        menuList.Add(new MenuList("F12: Open/close menu", string.Empty));
+        menuList.Add(new MenuList("Esc: Close menu", string.Empty));
+        menuList.Add(new MenuList("Up: Move (hold to repeat)", string.Empty));
+        menuList.Add(new MenuList("Down: Move (hold to repeat)", string.Empty));
+        menuList.Add(new MenuList("Page Up: Jump", string.Empty));
+        menuList.Add(new MenuList("Page Down: Jump", string.Empty));
+        menuList.Add(new MenuList("Enter: Select", string.Empty));
+        menuList.Add(new MenuList("Space: Launch", string.Empty));
+        menuList.Add(new MenuList("Left: Change setting / back", string.Empty));
+        menuList.Add(new MenuList("Right: Change setting", string.Empty));
+        menuList.Add(new MenuList("Backspace: Back", string.Empty));
     }
 
     private void ProcessCommand(string command, string[] args)
