@@ -8,12 +8,25 @@ textures, audio output, input and host timing.
 
 - .NET SDK 10
 - Windows (the project uses the SDL3-CS Windows native packages)
-- The stock C64 ROM images in `C64Emulator/Roms/`:
-  - `kernal.rom`
-  - `basic.rom`
-  - `char.rom`
+- The stock C64 ROM images in `C64Emulator/Roms/` (see below)
 
-The project copies the ROMs and the window icon to the output directory.
+### ROM images are not included
+
+The C64 KERNAL, BASIC and character ROMs and the 1541 DOS ROM are copyrighted
+by Commodore/Cloanto, so they are **not** distributed with this repository and
+are ignored by Git. Add your own legally obtained copies to
+`C64Emulator/Roms/` before building or running:
+
+| File | Size | Contents |
+| --- | --- | --- |
+| `kernal.rom` | 8192 bytes | KERNAL, `$E000-$FFFF` (required) |
+| `basic.rom` | 8192 bytes | BASIC, `$A000-$BFFF` (required) |
+| `char.rom` | 4096 bytes | Character generator, `$D000-$DFFF` (required) |
+| `dos1541.rom` | 16384 bytes | 1541 DOS ROM, only for True Drive Emulation |
+
+The files are not downloaded automatically. `C64Emulator/Roms/README.md` has
+the same list with more detail. The project copies the ROMs and the window icon
+to the output directory.
 
 ## Build and run
 

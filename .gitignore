@@ -190,3 +190,7 @@ Thumbs.db
 **/.vs/
 /diagnostics
 /.cloud-attachments
+
+# C64 ROM images: copyrighted, not distributed with the repository.
+# Keep your own copies in C64Emulator/Roms/ locally; they are never committed.
+C64Emulator/Roms/*.rom
