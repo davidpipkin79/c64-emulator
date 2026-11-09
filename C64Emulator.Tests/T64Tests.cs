@@ -134,7 +134,7 @@ public sealed class T64Tests
         Assert.Equal(0x1235, machine.Cpu.GetPC());
         Assert.Equal(0x41, machine.Memory.Peek(0x0801));
         Assert.Equal(0x42, machine.Memory.Peek(0x0802));
-        Assert.Equal(0x02, machine.Cpu.X);
+        Assert.Equal(0x03, machine.Cpu.X);
         Assert.Equal(0x08, machine.Cpu.Y);
         Assert.Equal(0, machine.Cpu.P & 0x01);
     }

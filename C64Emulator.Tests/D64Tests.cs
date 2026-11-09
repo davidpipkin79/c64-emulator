@@ -28,6 +28,58 @@ public sealed class D64Tests
     }
 
     [Fact]
+    public void LastSectorPaddingStaysInMemoryButNotInTheEndPointer()
+    {
+        var image = CreateImage(("GAME", new byte[] { 0x01, 0x08, 0x41, 0x42 }));
+        image[Offset(1, 0) + 2 + 4] = 0xAA;
+
+        D64Image disk = D64Image.FromBytes(image);
+        D64FileInfo file = disk.Directory[0];
+
+        Assert.Equal(new byte[] { 0x01, 0x08, 0x41, 0x42 }, disk.ReadFile(file));
+
+        byte[] padded = disk.ReadFileWithPadding(file, out var usedLength);
+        Assert.Equal(4, usedLength);
+        Assert.Equal(D64Image.SectorSize - 2, padded.Length);
+        Assert.Equal(0xAA, padded[4]);
+    }
+
+    [Fact]
+    public void KernalLoadWritesTheLastSectorTail()
+    {
+        var romDirectory = Path.GetFullPath(
+            Path.Combine(
+                AppContext.BaseDirectory,
+                "..", "..", "..", "..",
+                "C64Emulator", "Roms"));
+
+        if (!File.Exists(Path.Combine(romDirectory, "kernal.rom")))
+            return;
+
+        var image = CreateImage(("GAME", new byte[] { 0x01, 0x08, 0x41, 0x42 }));
+        image[Offset(1, 0) + 2 + 4] = 0xAA;
+
+        using C64Machine machine = new C64Machine(RomSet.Load(romDirectory));
+        machine.Drive.Mount(D64Image.FromBytes(image));
+        WriteFilename(machine, "GAME");
+        machine.Memory.Poke(0xB9, 1);
+        machine.Memory.Poke(0xBA, 8);
+        machine.Cpu.S = 0xFD;
+        machine.Memory.Poke(0x01FE, 0x34);
+        machine.Memory.Poke(0x01FF, 0x12);
+        machine.Cpu.A = 0;
+        machine.Cpu.SetPC(0xFFD5);
+
+        machine.RunCycles(1);
+
+        Assert.Equal(0x41, machine.Memory.Peek(0x0801));
+        Assert.Equal(0x42, machine.Memory.Peek(0x0802));
+        Assert.Equal(0xAA, machine.Memory.Peek(0x0803));
+        Assert.Equal(0x03, machine.Memory.Peek(0xC3));
+        Assert.Equal(0x08, machine.Memory.Peek(0xC4));
+    }
+
+    [Fact]
     public void WildcardAndFirstProgramLookupsWork()
     {
         var image = CreateImage(
@@ -189,9 +241,9 @@ public sealed class D64Tests
         Assert.Equal(0x42, machine.Memory.Peek(0x0802));
         Assert.Equal(0x01, machine.Memory.Peek(0xC1));
         Assert.Equal(0x08, machine.Memory.Peek(0xC2));
-        Assert.Equal(0x02, machine.Memory.Peek(0xC3));
+        Assert.Equal(0x03, machine.Memory.Peek(0xC3));
         Assert.Equal(0x08, machine.Memory.Peek(0xC4));
-        Assert.Equal(0x02, machine.Memory.Peek(0xAE));
+        Assert.Equal(0x03, machine.Memory.Peek(0xAE));
         Assert.Equal(0x08, machine.Memory.Peek(0xAF));
         Assert.Equal(0x08, machine.Memory.Peek(0xBA));
     }
@@ -282,9 +334,9 @@ public sealed class D64Tests
         Assert.Equal(0x42, machine.Memory.Peek(0x0802));
         Assert.Equal(0x01, machine.Memory.Peek(0xC1));
         Assert.Equal(0x08, machine.Memory.Peek(0xC2));
-        Assert.Equal(0x02, machine.Memory.Peek(0xC3));
+        Assert.Equal(0x03, machine.Memory.Peek(0xC3));
         Assert.Equal(0x08, machine.Memory.Peek(0xC4));
-        Assert.Equal(0x02, machine.Cpu.X);
+        Assert.Equal(0x03, machine.Cpu.X);
         Assert.Equal(0x08, machine.Cpu.Y);
         Assert.Equal(0, machine.Cpu.P & 0x01);
     }

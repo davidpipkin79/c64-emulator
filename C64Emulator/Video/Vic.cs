@@ -83,6 +83,8 @@ internal sealed class Vic : IVideoBank
     private readonly bool[] spriteDmaActive = new bool[8];
     private readonly int[] spriteDmaRemaining = new int[8];
     private readonly int[] spriteMemptr = new int[8];
+    private readonly int[] spriteDmaStartLine = new int[8];
+    private readonly int[] spriteDmaHeight = new int[8];
     private readonly bool[] spriteExpandFlip = new bool[8];
 
     // Derived per-line timing/visibility masks. They are rebuilt from the
@@ -104,6 +106,16 @@ internal sealed class Vic : IVideoBank
     private bool lineIsBadline;
     private bool previousLineWasBadline;
     private int rowCounter;
+
+    // Scanline selected for this line's glyph fetch. Usually the same as
+    // rowCounter, but a late YSCROLL write can add one extra line before
+    // the next badline; that line repeats scanline 7 instead of wrapping
+    // to the first glyph row. Not part of the save-state layout.
+    [NonSerialized] private int glyphRowCounter;
+    [NonSerialized] private bool extraGlyphScanline;
+    [NonSerialized] private ushort glyphLinePixelMatrixAddress;
+    [NonSerialized] private bool glyphLineBitmapMode;
+    [NonSerialized] private VideoMode glyphLineVideoMode;
     private int stolenCycles;
 
     private RgbColor[,] frontBuffer;
@@ -201,6 +213,11 @@ internal sealed class Vic : IVideoBank
         lineIsBadline = false;
         previousLineWasBadline = false;
         rowCounter = 0;
+        glyphRowCounter = 0;
+        extraGlyphScanline = false;
+        glyphLinePixelMatrixAddress = 0;
+        glyphLineBitmapMode = false;
+        glyphLineVideoMode = VideoMode.SimpleCharacterMode;
         stolenCycles = 0;
         currentVideoMode = VideoMode.SimpleCharacterMode;
         bitmapMode = false;
@@ -210,6 +227,8 @@ internal sealed class Vic : IVideoBank
         Array.Clear(spriteDmaActive);
         Array.Clear(spriteDmaRemaining);
         Array.Clear(spriteMemptr);
+        Array.Fill(spriteDmaStartLine, -1);
+        Array.Clear(spriteDmaHeight);
         Array.Clear(spriteExpandFlip);
         Array.Fill(spriteFetchOwner, (sbyte)-1);
         spriteFetchMask = 0;
@@ -619,15 +638,6 @@ internal sealed class Vic : IVideoBank
                 break;
         }
 
-        // Sprite Y, enable and height affect the next line's DMA lead-in
-        // and the set of sprites that can appear on this raster line.
-        if (
-            (register >= 0x01 && register <= 0x0F && (register & 1) != 0) ||
-            register == 0x15 ||
-            register == 0x17)
-        {
-            RefreshSpriteCaches();
-        }
     }
 
     public byte[] CapturePackedScreen()
@@ -696,6 +706,20 @@ internal sealed class Vic : IVideoBank
             return;
 
         Pixel pixel = GetBackgroundPixel(x, y);
+
+        // The border is drawn over the sprite layer. A sprite is only
+        // visible inside the display window unless a border-opening trick
+        // has cleared the flip-flop for this pixel; X=0..23 are covered
+        // (fully at 0, partly at 1..23), and the top/bottom border covers
+        // sprites on lines outside the window as well.
+        if (borderFlipFlop)
+        {
+            if (draw)
+                backBuffer[screenX, screenY] = pixel.PixelColor;
+
+            return;
+        }
+
         var collisionMask = 0;
         var firstSprite = -1;
         var firstFrontSprite = -1;
@@ -1046,7 +1070,35 @@ internal sealed class Vic : IVideoBank
         var glyphFetchStart = 16 + busOffset;
 
         if (cycle >= glyphFetchStart && cycle < glyphFetchStart + 40)
-            FetchGlyphCell(cycle - glyphFetchStart);
+        {
+            if (extraGlyphScanline)
+            {
+                var splitChangesGlyphSource =
+                    glyphLinePixelMatrixAddress != pixelMatrixAddress ||
+                    glyphLineBitmapMode != bitmapMode ||
+                    glyphLineVideoMode != currentVideoMode;
+
+                if (splitChangesGlyphSource)
+                {
+                    // The extra scanline is the edge of the row that just
+                    // ended. The split is setting up the following row, so
+                    // do not expose either charset's tile row at the edge.
+                    glyphRow[cycle - glyphFetchStart] = 0;
+                }
+                else
+                {
+                    FetchGlyphCell(
+                        cycle - glyphFetchStart,
+                        glyphLinePixelMatrixAddress,
+                        glyphLineBitmapMode,
+                        glyphLineVideoMode);
+                }
+            }
+            else
+            {
+                FetchGlyphCell(cycle - glyphFetchStart);
+            }
+        }
 
         var fetchSprite = spriteFetchOwner[cycle];
 
@@ -1087,6 +1139,13 @@ internal sealed class Vic : IVideoBank
     {
         borderFlipFlop = true;
 
+        // Character-base/mode changes made during this line belong to the
+        // next row. If a late YSCROLL makes this an extra scanline, the row
+        // that just ended must still be fetched from the base latched here.
+        glyphLinePixelMatrixAddress = pixelMatrixAddress;
+        glyphLineBitmapMode = bitmapMode;
+        glyphLineVideoMode = currentVideoMode;
+
         if (currentHLine == FirstDisplayLine)
         {
             // DEN is sampled while raster $30 is active. VCBASE restarts
@@ -1094,6 +1153,7 @@ internal sealed class Vic : IVideoBank
             denLatched = false;
             videoCounterBase = 0;
             rowCounter = 0;
+            glyphRowCounter = 0;
             previousLineWasBadline = false;
         }
 
@@ -1105,6 +1165,11 @@ internal sealed class Vic : IVideoBank
             currentHLine >= FirstDisplayLine &&
             currentHLine <= 0xF7 &&
             (currentHLine & 0x07) == verticalScroll;
+
+        var extraScanline =
+            !lineIsBadline &&
+            rowCounter == 7 &&
+            ((currentHLine + 1) & 0x07) == verticalScroll;
 
         // VCBASE advances when a character row completes, not on every
         // badline. During raster splits badlines can be closer than eight
@@ -1129,8 +1194,23 @@ internal sealed class Vic : IVideoBank
             rowCounter = (rowCounter + 1) & 0x07;
         }
 
+        // YSCROLL can be changed late in a line, delaying the next badline
+        // by one scanline (Maniac Mansion's selection screen does this at
+        // raster 195). That extra line must repeat the last glyph scanline,
+        // not wrap to row 0; keep rowCounter itself unchanged so the
+        // following badline's VCBASE timing is unaffected.
+        glyphRowCounter = extraScanline ? 7 : rowCounter;
+        extraGlyphScanline = extraScanline;
+
         previousLineWasBadline = lineIsBadline;
+
+        // The line that is starting displays the sprite bytes fetched during
+        // the previous line. Latch visibility before UpdateSpriteDma starts a
+        // new block: a player changing Y on line N makes the old block's last
+        // line and the new block's first line meet without a gap.
+        UpdateSpriteLineMask();
         UpdateSpriteDma();
+        UpdateSpriteBusMasks();
     }
 
     private void FetchMatrixCell(int column)
@@ -1144,13 +1224,26 @@ internal sealed class Vic : IVideoBank
 
     private void FetchGlyphCell(int column)
     {
-        var cell = bitmapMode ? matrixRowStart + column : matrixRow[column];
+        FetchGlyphCell(
+            column,
+            pixelMatrixAddress,
+            bitmapMode,
+            currentVideoMode);
+    }
 
-        if (currentVideoMode == VideoMode.ExtendedColorCharacterMode)
+    private void FetchGlyphCell(
+        int column,
+        ushort characterBase,
+        bool bitmap,
+        VideoMode videoMode)
+    {
+        var cell = bitmap ? matrixRowStart + column : matrixRow[column];
+
+        if (videoMode == VideoMode.ExtendedColorCharacterMode)
             cell = matrixRow[column] & 0x3F;
 
         glyphRow[column] = bus.Read(
-            (ushort)(pixelMatrixAddress + cell * 8 + rowCounter));
+            (ushort)(characterBase + cell * 8 + glyphRowCounter));
     }
 
     private void UpdateSpriteDma()
@@ -1167,6 +1260,7 @@ internal sealed class Vic : IVideoBank
                 spriteDmaActive[sprite] = false;
                 spriteDmaRemaining[sprite] = 0;
                 spriteMemptr[sprite] = 0;
+                spriteDmaStartLine[sprite] = -1;
                 continue;
             }
 
@@ -1175,6 +1269,8 @@ internal sealed class Vic : IVideoBank
                 spriteDmaActive[sprite] = true;
                 spriteDmaRemaining[sprite] = Math.Max(0, sprites[sprite].Height - 1);
                 spriteMemptr[sprite] = 0;
+                spriteDmaStartLine[sprite] = currentHLine;
+                spriteDmaHeight[sprite] = sprites[sprite].Height;
                 spriteExpandFlip[sprite] = false;
             }
             else if (spriteDmaRemaining[sprite] > 0)
@@ -1197,11 +1293,11 @@ internal sealed class Vic : IVideoBank
             else
             {
                 spriteDmaActive[sprite] = false;
+                spriteDmaStartLine[sprite] = -1;
             }
         }
 
         Array.Copy(spriteNextData, spriteData, spriteNextData.Length);
-        RefreshSpriteCaches();
     }
 
     private void RefreshSpriteCaches()
@@ -1271,13 +1367,35 @@ internal sealed class Vic : IVideoBank
         {
             ref Sprite spriteState = ref sprites[sprite];
 
-            if (
-                spriteState.Enabled &&
-                y >= spriteState.Y + 1 &&
-                y < spriteState.Y + 1 + spriteState.Height)
+            if (!spriteState.Enabled || !spriteDmaActive[sprite])
+                continue;
+
+            var startLine = spriteDmaStartLine[sprite];
+
+            if (startLine < 0)
             {
-                mask |= (byte)(1 << sprite);
+                // A restored state may not have the DMA start line yet;
+                // fall back to the Y comparison until the next DMA.
+                if (
+                    y >= spriteState.Y + 1 &&
+                    y < spriteState.Y + 1 + spriteState.Height)
+                {
+                    mask |= (byte)(1 << sprite);
+                }
+
+                continue;
             }
+
+            var delta = y - startLine;
+
+            if (delta < 0)
+                delta += timing.RasterLines;
+
+            // The bytes fetched when DMA starts at Y are displayed on the
+            // next line, and the sprite stays visible for its DMA height.
+            // A Y write during the sprite must not cut it off mid-sprite.
+            if (delta >= 1 && delta <= spriteDmaHeight[sprite])
+                mask |= (byte)(1 << sprite);
         }
 
         lineSpriteMask = mask;

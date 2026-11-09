@@ -139,6 +139,16 @@ internal sealed class DiskDrive
         return mounted.ReadFile(file);
     }
 
+    public byte[] ReadFileWithPadding(D64FileInfo file, out int usedLength)
+    {
+        D64Image? mounted = image;
+
+        if (mounted is null)
+            throw new InvalidOperationException("No disk is mounted.");
+
+        return mounted.ReadFileWithPadding(file, out usedLength);
+    }
+
     public static byte[]? TryLoadRom(string directory)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(directory);

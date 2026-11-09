@@ -1,4 +1,0 @@
-break 080b
-command 1 "r; m 0040 004f; x"
-break 004a
-command 2 "r; m 0040 004f; x"

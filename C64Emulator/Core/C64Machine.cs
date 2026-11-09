@@ -171,6 +171,13 @@ internal sealed class C64Machine : IDisposable
 
     public Cartridge? Cartridge => Memory.Cartridge;
 
+    internal Action<string>? DebugLog { get; set; }
+
+    private void LogDebug(string message)
+    {
+        DebugLog?.Invoke(message);
+    }
+
     public bool Paused
     {
         get => paused;
@@ -735,9 +742,9 @@ internal sealed class C64Machine : IDisposable
         D64FileInfo file = Drive.FindFile(name) ??
             throw new FileNotFoundException("File not found on disk: " + name);
 
-        var program = Drive.ReadFile(file);
+        var program = Drive.ReadFileWithPadding(file, out var usedLength);
         Memory.Poke(0xBA, 8);
-        LoadProgramBytes(program, run: true);
+        LoadProgramBytes(program, run: true, usedLength);
     }
 
     public void MountTape(string path)
@@ -807,15 +814,19 @@ internal sealed class C64Machine : IDisposable
         LoadProgramBytes(program, run: true);
     }
 
-    private void LoadProgramBytes(byte[] program, bool run)
+    private void LoadProgramBytes(byte[] program, bool run, int usedLength = -1)
     {
         ResetRewind();
 
         if (program.Length < 2)
             throw new InvalidDataException("Program file is too short.");
 
+        if (usedLength < 2 || usedLength > program.Length)
+            usedLength = program.Length;
+
         var address = program[0] | (program[1] << 8);
         var length = program.Length - 2;
+        var usedPayload = usedLength - 2;
 
         if (address + length > 0x10000)
             throw new InvalidDataException("Program does not fit in 64 KB.");
@@ -823,10 +834,12 @@ internal sealed class C64Machine : IDisposable
         for (var i = 0; i < length; i++)
             Memory.Poke((ushort)(address + i), program[i + 2]);
 
-        // Match the KERNAL LOAD result pointers. Programs loaded through
-        // the menu never execute the KERNAL's LOAD routine, and some boot
-        // loaders read these while relocating or loading the next file.
-        var endAddress = address + Math.Max(length - 1, 0);
+        // Match the KERNAL LOAD result pointers. The KERNAL returns the
+        // address after the last used byte, and BASIC stores that value
+        // in VARTAB. Programs loaded through the menu never execute the
+        // KERNAL's LOAD routine, and some boot loaders read these while
+        // relocating or loading the next file.
+        var endAddress = address + usedPayload;
         Memory.Poke(0xC1, (byte)(address & 0xFF));
         Memory.Poke(0xC2, (byte)(address >> 8));
         Memory.Poke(0xC3, (byte)(endAddress & 0xFF));
@@ -839,11 +852,10 @@ internal sealed class C64Machine : IDisposable
 
         if (address == 0x0801)
         {
-            var end = address + length;
             Memory.Poke(0x2B, 0x01);
             Memory.Poke(0x2C, 0x08);
-            Memory.Poke(0x2D, (byte)(end & 0xFF));
-            Memory.Poke(0x2E, (byte)((end >> 8) & 0xFF));
+            Memory.Poke(0x2D, (byte)(endAddress & 0xFF));
+            Memory.Poke(0x2E, (byte)(endAddress >> 8));
             StartBasicProgram();
         }
         else
@@ -1068,6 +1080,7 @@ internal sealed class C64Machine : IDisposable
             return 5; // DEVICE NOT PRESENT
 
         var name = ReadKernalFilename();
+        LogDebug($"LOAD dev={Memory.Peek(0xBA)} name='{name}'");
 
         if (name == "$")
             return 4; // A directory listing is not provided through LOAD here.
@@ -1075,9 +1088,16 @@ internal sealed class C64Machine : IDisposable
         D64FileInfo? file = Drive.FindFile(name);
 
         if (file is null)
+        {
+            LogDebug($"LOAD not found name='{name}'");
             return 4; // FILE NOT FOUND
+        }
 
-        return LoadProgramImage(Drive.ReadFile(file), out endAddress);
+        var program = Drive.ReadFileWithPadding(file, out var usedLength);
+        LogDebug($"LOAD found name='{name}' bytes={program.Length} used={usedLength}");
+        var result = LoadProgramImage(program, out endAddress, usedLength);
+        LogDebug($"LOAD result error={result:X2} end={endAddress:X4}");
+        return result;
     }
 
     private byte LoadFromTape(out ushort endAddress)
@@ -1100,12 +1120,18 @@ internal sealed class C64Machine : IDisposable
         return LoadProgramImage(Tape.CreatePrg(file), out endAddress);
     }
 
-    private byte LoadProgramImage(byte[] program, out ushort endAddress)
+    private byte LoadProgramImage(
+        byte[] program,
+        out ushort endAddress,
+        int usedLength = -1)
     {
         endAddress = 0;
 
         if (program.Length < 2)
             return 4;
+
+        if (usedLength < 2 || usedLength > program.Length)
+            usedLength = program.Length;
 
         var fileAddress = program[0] | (program[1] << 8);
         var requestedAddress = Cpu.X | (Cpu.Y << 8);
@@ -1113,13 +1139,14 @@ internal sealed class C64Machine : IDisposable
             Memory.Peek(0xB9) == 0 && requestedAddress != 0;
         var address = useRequestedAddress ? requestedAddress : fileAddress;
         var length = program.Length - 2;
+        var usedPayload = usedLength - 2;
 
         if (address + length > 0x10000)
             return 4;
 
         if (Cpu.A != 0)
         {
-            for (var i = 0; i < length; i++)
+            for (var i = 0; i < usedPayload; i++)
             {
                 if (Memory.Peek((ushort)(address + i)) != program[i + 2])
                     return 0x1C; // VERIFY ERROR
@@ -1131,7 +1158,7 @@ internal sealed class C64Machine : IDisposable
                 Memory.Poke((ushort)(address + i), program[i + 2]);
         }
 
-        endAddress = (ushort)(address + Math.Max(length - 1, 0));
+        endAddress = (ushort)(address + usedPayload);
         Memory.Poke(0xC1, (byte)(address & 0xFF));
         Memory.Poke(0xC2, (byte)(address >> 8));
         Memory.Poke(0xC3, (byte)(endAddress & 0xFF));
@@ -1251,6 +1278,8 @@ internal sealed class C64Machine : IDisposable
         }
 
         var name = ReadKernalFilename();
+        LogDebug(
+            $"OPEN dev={device} la={logical} sa={Memory.Peek(0xB9)} name='{name}'");
         byte[] data;
 
         if (name == "$")
@@ -1263,6 +1292,7 @@ internal sealed class C64Machine : IDisposable
 
             if (file is null)
             {
+                LogDebug($"OPEN not found name='{name}'");
                 error = 4; // FILE NOT FOUND
                 return true;
             }
@@ -1275,6 +1305,7 @@ internal sealed class C64Machine : IDisposable
 
             if (file is null)
             {
+                LogDebug($"OPEN not found name='{name}'");
                 error = 4;
                 return true;
             }
@@ -1282,6 +1313,7 @@ internal sealed class C64Machine : IDisposable
             data = Tape.ReadFile(file);
         }
 
+        LogDebug($"OPEN found name='{name}' bytes={data.Length}");
         CloseKernalChannel(logical);
         kernalChannels[logical] = new KernalChannel(data);
         Memory.Poke(0x90, 0);
@@ -1301,10 +1333,14 @@ internal sealed class C64Machine : IDisposable
 
         if (channel.Position >= channel.Data.Length)
         {
+            LogDebug($"CHRIN end la={kernalInputChannel} len={channel.Data.Length}");
             Cpu.A = 0;
             SetKernalStatus(0x40);
             return cycles;
         }
+
+        if (channel.Position == 0)
+            LogDebug($"CHRIN start la={kernalInputChannel} len={channel.Data.Length}");
 
         Cpu.A = channel.Data[channel.Position++];
 

@@ -852,6 +852,116 @@ public sealed class VicTests : IDisposable
     }
 
     [Fact]
+    public void BorderCoversSpritesParkedOutsideTheDisplayWindow()
+    {
+        Vic vic = system.Vic!;
+
+        // $D018=$00: matrix $C000, sprite pointers at $C3F8, data at $C040.
+        vic.SetRegister(0x18, 0x00);
+        system.Memory.Poke(0xC3F8, 0x01);
+
+        for (var i = 0; i < 63; i++)
+            system.Memory.Poke((ushort)(0xC040 + i), 0xFF);
+
+        vic.SetRegister(0x15, 0x01); // sprite 0
+        vic.SetRegister(0x27, 0x02); // red
+        vic.SetRegister(0x20, 0x00); // black border
+        vic.SetRegister(0x21, 0x00); // black background
+        vic.SetRegister(0x01, 100);  // Y
+
+        // X=0..23 lie in the left border. The border is drawn over the
+        // sprite layer, so a parked sprite must not leak a green/red bar
+        // into the border like Maniac Mansion's loading leftovers did.
+        vic.SetRegister(0x00, 0);
+        vic.Tick(vic.FrameCycles);
+        var parked = vic.CapturePackedScreen();
+        Assert.Equal(0, PaletteIndexAt(parked, 20, 101));
+        Assert.Equal(0, PaletteIndexAt(parked, 43, 101));
+
+        // X=24 is the first pixel inside the display window.
+        vic.SetRegister(0x00, 24);
+        vic.Tick(vic.FrameCycles);
+        var visible = vic.CapturePackedScreen();
+        Assert.Equal(2, PaletteIndexAt(visible, 44, 101));
+    }
+
+    [Fact]
+    public void SpriteYWriteMidSpriteKeepsTheDmaDrivenSpriteVisible()
+    {
+        Vic vic = system.Vic!;
+
+        // $D018=$00: matrix $C000, sprite pointers at $C3F8, data at $C040.
+        vic.SetRegister(0x18, 0x00);
+        system.Memory.Poke(0xC3F8, 0x01);
+
+        for (var i = 0; i < 63; i++)
+            system.Memory.Poke((ushort)(0xC040 + i), 0xFF);
+
+        vic.SetRegister(0x15, 0x01); // sprite 0
+        vic.SetRegister(0x27, 0x02); // red
+        vic.SetRegister(0x20, 0x00); // black border
+        vic.SetRegister(0x21, 0x00); // black background
+        vic.SetRegister(0x00, 24);   // first visible pixel x=44
+        vic.SetRegister(0x01, 100);  // DMA starts at line 100
+
+        // Establish the sprite on its first display line, then change Y
+        // while the sprite's DMA for those lines is still running.
+        vic.Tick(vic.FrameCycles);
+        TickToCycle(vic, 101, 0);
+        vic.SetRegister(0x01, 50);
+        TickFrame(vic);
+
+        var screen = vic.CapturePackedScreen();
+
+        // The sprite began DMA at Y=100, so it must stay visible for all
+        // 21 lines even though Y now points at 50.
+        Assert.Equal(2, PaletteIndexAt(screen, 44, 101));
+        Assert.Equal(2, PaletteIndexAt(screen, 44, 102));
+        Assert.Equal(2, PaletteIndexAt(screen, 44, 110));
+
+        // A 21-line sprite occupies Y+1 through Y+21. Its last line is the
+        // one whose bytes were fetched on the final DMA line.
+        Assert.Equal(2, PaletteIndexAt(screen, 44, 112));
+        Assert.Equal(0, PaletteIndexAt(screen, 44, 113));
+        Assert.Equal(0, PaletteIndexAt(screen, 44, 122));
+    }
+
+    [Fact]
+    public void SpriteRestartOnTheLastDisplayLineLeavesNoSeam()
+    {
+        Vic vic = system.Vic!;
+
+        // $D018=$00: matrix $C000, sprite pointers at $C3F8, data at $C040.
+        vic.SetRegister(0x18, 0x00);
+        system.Memory.Poke(0xC3F8, 0x01);
+
+        for (var i = 0; i < 63; i++)
+            system.Memory.Poke((ushort)(0xC040 + i), 0xFF);
+
+        vic.SetRegister(0x15, 0x01); // sprite 0
+        vic.SetRegister(0x27, 0x02); // red
+        vic.SetRegister(0x20, 0x00); // black border
+        vic.SetRegister(0x21, 0x00); // black background
+        vic.SetRegister(0x00, 24);   // first visible pixel x=44
+        vic.SetRegister(0x01, 100);  // DMA starts at line 100
+
+        vic.Tick(vic.FrameCycles);
+
+        // Maniac Mansion starts the next block of a tall character on the
+        // last display line of the previous block (Y=121 here). Line 121
+        // still shows the old block's final row while the new block's first
+        // row is fetched; line 122 shows the new block.
+        TickToCycle(vic, 120, 0);
+        vic.SetRegister(0x01, 121);
+        TickFrame(vic);
+
+        var screen = vic.CapturePackedScreen();
+
+        Assert.Equal(2, PaletteIndexAt(screen, 44, 112));
+        Assert.Equal(2, PaletteIndexAt(screen, 44, 113));
+    }
+
+    [Fact]
     public void SpriteCollisions_UpdateWithoutRendering()
     {
         Vic vic = system.Vic!;
@@ -882,6 +992,52 @@ public sealed class VicTests : IDisposable
         vic.Tick(vic.FrameCycles);
 
         Assert.NotEqual(0, vic.GetRegister(0x1E) & 0x03);
+    }
+
+    [Fact]
+    public void LateYScrollExtraScanlineRepeatsTheLastGlyphRow()
+    {
+        Vic vic = system.Vic!;
+
+        // $D018=$12: matrix $C400, characters $C800. Every cell uses
+        // character 1; scanline 0 has a foreground pixel, scanline 7 is
+        // background. A delayed badline that wraps to row 0 makes the
+        // line below the box visible.
+        vic.SetRegister(0x18, 0x12);
+
+        for (var i = 0; i < 1000; i++)
+        {
+            system.Memory.Poke((ushort)(0xC400 + i), 1);
+            system.ColorRam!.Write((ushort)i, 1);
+        }
+
+        system.Memory.Poke(0xC808, 0x01);
+
+        for (var i = 1; i < 8; i++)
+            system.Memory.Poke((ushort)(0xC808 + i), 0);
+
+        vic.SetRegister(0x20, 0x00); // black border
+        vic.SetRegister(0x21, 0x00); // black background
+        vic.SetRegister(0x16, 0x08); // 40 columns, XSCROLL 0
+        vic.SetRegister(0x11, 0x1C); // DEN, 25 rows, YSCROLL 4
+
+        vic.Tick(vic.FrameCycles);
+        TickToCycle(vic, 195, 41);
+
+        // Change YSCROLL after the line has started. Line 196 is now an
+        // extra scanline before the next badline. It must repeat scanline
+        // 7 (background) instead of wrapping to scanline 0.
+        vic.SetRegister(0x11, 0x1D); // YSCROLL 5
+
+        // Maniac Mansion also switches the character base on this line.
+        // The extra edge scanline must not expose the new base's tile row;
+        // it stays background instead.
+        system.Memory.Poke(0xE808, 0xFF);
+        vic.SetRegister(0x18, 0x1A); // matrix $C400, characters $E800
+        TickFrame(vic);
+
+        var screen = vic.CapturePackedScreen();
+        Assert.Equal(0, PaletteIndexAt(screen, 44, 196 - 9));
     }
 
     private void ConfigureCharacterPattern()

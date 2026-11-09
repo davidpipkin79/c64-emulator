@@ -188,3 +188,4 @@ Thumbs.db
 # IDE caches
 .vs/
 **/.vs/
+/diagnostics

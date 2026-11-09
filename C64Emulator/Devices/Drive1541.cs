@@ -272,7 +272,7 @@ internal sealed class Drive1541
         // PB4 switches the serial lines between output and input. While
         // it is clear the drive can drive DATA/CLK and acknowledge ATN;
         // the command handler sets it to receive the host's bytes.
-        var outputsEnabled = (output & 0x10) == 0;
+        var atnaEnabled = (output & 0x10) == 0;
 
         var dataLow =
             (direction & 0x02) != 0 &&
@@ -287,9 +287,14 @@ internal sealed class Drive1541
         // check, then it releases so the host can send the command. A
         // drive that is busy therefore delays the transfer instead of
         // missing the command bytes.
+        // The uploaded fast loader runs from RAM and toggles ATN on every
+        // bit pair, so the automatic acknowledge must stay out of its way;
+        // the DOS command path in ROM still needs it to answer the host.
+        var fastLoaderActive = cpu.GetPC() < 0xC000;
         var atna =
             iec.AtnLow &&
-            (outputsEnabled || atnaMinimum > 0);
+            !fastLoaderActive &&
+            (atnaEnabled || atnaMinimum > 0);
 
         iec.SetDrive(clockLow, dataLow, atna);
     }

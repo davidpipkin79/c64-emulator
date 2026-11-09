@@ -274,6 +274,25 @@ internal sealed class D64Image
 
     public byte[] ReadFile(D64FileInfo file)
     {
+        return ReadFile(file, includeLastSectorPadding: false, out _);
+    }
+
+    /// <summary>
+    /// Reads a file and includes the unused tail of its last sector. The
+    /// KERNAL leaves that tail in memory and reports the used length
+    /// separately; some fast loaders read it while relocating.
+    /// </summary>
+    public byte[] ReadFileWithPadding(D64FileInfo file, out int usedLength)
+    {
+        return ReadFile(file, includeLastSectorPadding: true, out usedLength);
+    }
+
+    private byte[] ReadFile(
+        D64FileInfo file,
+        bool includeLastSectorPadding,
+        out int usedLength)
+    {
+        usedLength = 0;
         ArgumentNullException.ThrowIfNull(file);
 
         if (!file.Closed)
@@ -309,9 +328,17 @@ internal sealed class D64Image
                     ? SectorSize - 2
                     : Math.Clamp(nextSector - 1, 0, SectorSize - 2)
                 : SectorSize - 2;
+            // The KERNAL copies the whole final sector into memory and
+            // reports the used length separately. Preserve that tail for
+            // boot loaders that read just past the end of the file.
+            var copy = nextTrack == 0 && includeLastSectorPadding
+                ? SectorSize - 2
+                : used;
 
-            for (var i = 0; i < used; i++)
+            for (var i = 0; i < copy; i++)
                 bytes.Add(block[2 + i]);
+
+            usedLength += used;
 
             if (nextTrack == 0)
                 break;
