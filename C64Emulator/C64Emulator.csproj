@@ -29,13 +29,18 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The ROMs stay in Roms\ so Solution Explorer groups them there. The
+         host loads them from its own directory (AppContext.BaseDirectory), so
+         TargetPath flattens the copy to the output root. Link would flatten
+         the copy too, but it also moves the files to the project root in
+         Solution Explorer. -->
     <None Update="Roms\*.rom">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>%(Filename)%(Extension)</Link>
+      <TargetPath>%(Filename)%(Extension)</TargetPath>
     </None>
     <None Update="Assets\c64icon.bmp">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>c64icon.bmp</Link>
+      <TargetPath>c64icon.bmp</TargetPath>
     </None>
   </ItemGroup>
 
