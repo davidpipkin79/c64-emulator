@@ -434,21 +434,25 @@ internal sealed class Cia1 : Cia6526
 
     private byte readPortA()
     {
-        var input =
-            (byte)(
-            0xE0 |
-            (joyPort2Up ? 0 : 0x01) |
-            (joyPort2Down ? 0 : 0x02) |
-            (joyPort2Left ? 0 : 0x04) |
-            (joyPort2Right ? 0 : 0x08) |
-            (joyPort2Fire ? 0 : 0x10)
-            );
-
-        return
+        // A port read returns the levels present on the pins, not the output
+        // latch. A joystick switch pulls its line to ground even while the
+        // DDR is driving that pin high, so the active-low joystick inputs
+        // belong on the pin state. The KERNAL leaves DDRA at $FF after its
+        // keyboard scan, and games such as Archon read $DC00 without ever
+        // touching the direction register.
+        var pins =
             (byte)(
             (PortAOutput & PortADirection) |
-            (input & ~PortADirection)
+            (~PortADirection & 0xFF)
             );
+
+        if (joyPort2Up) pins = (byte)(pins & 0xFE);
+        if (joyPort2Down) pins = (byte)(pins & 0xFD);
+        if (joyPort2Left) pins = (byte)(pins & 0xFB);
+        if (joyPort2Right) pins = (byte)(pins & 0xF7);
+        if (joyPort2Fire) pins = (byte)(pins & 0xEF);
+
+        return pins;
     }
 
     private byte readPortB()
@@ -456,25 +460,27 @@ internal sealed class Cia1 : Cia6526
         // Port A drives the keyboard rows low; port B reads the columns.
         // Pull-up inputs read high when no row is selected.
         var selectedRows = (byte)(PortAOutput | ~PortADirection);
-        byte input = 0xFF;
+        byte pulls = 0xFF;
 
         for (var i = 0; i < 8; i++)
             if ((selectedRows & (1 << i)) == 0)
-                input &= keyRows[i];
+                pulls &= keyRows[i];
 
-        if (joyPort1Up) input = (byte)(input & 0xFE);
-        if (joyPort1Down) input = (byte)(input & 0xFD);
-        if (joyPort1Left) input = (byte)(input & 0xFB);
-        if (joyPort1Right) input = (byte)(input & 0xF7);
-        if (joyPort1Fire) input = (byte)(input & 0xEF);
+        // Joystick switches ground their lines regardless of the DDR, so
+        // they overdrive the port outputs here just as they do on port A.
+        if (joyPort1Up) pulls = (byte)(pulls & 0xFE);
+        if (joyPort1Down) pulls = (byte)(pulls & 0xFD);
+        if (joyPort1Left) pulls = (byte)(pulls & 0xFB);
+        if (joyPort1Right) pulls = (byte)(pulls & 0xF7);
+        if (joyPort1Fire) pulls = (byte)(pulls & 0xEF);
 
-        var value =
+        var pins =
             (byte)(
             (PortBOutput & PortBDirection) |
-            (input & ~PortBDirection)
+            (~PortBDirection & 0xFF)
             );
 
-        return ApplyTimerOutputs(value);
+        return ApplyTimerOutputs((byte)(pins & pulls));
     }
 
 }

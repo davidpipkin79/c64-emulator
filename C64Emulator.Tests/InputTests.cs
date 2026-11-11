@@ -171,4 +171,98 @@ public sealed class InputTests : IDisposable
 
         Assert.Equal(0xEF, cia.Peek(0x00));
     }
+
+    [Theory]
+    [InlineData(JoystickFunction.Up, 0xFE)]
+    [InlineData(JoystickFunction.Down, 0xFD)]
+    [InlineData(JoystickFunction.Left, 0xFB)]
+    [InlineData(JoystickFunction.Right, 0xF7)]
+    [InlineData(JoystickFunction.Fire, 0xEF)]
+    public void JoystickTwo_OverridesPortAOutputPins(
+        JoystickFunction function,
+        byte expected)
+    {
+        Cia1 cia = system.Cia1!;
+
+        // The KERNAL keyboard scan leaves DDRA and PRA at $FF. The joystick
+        // switch still pulls its pin low, and the port read returns the pin
+        // state rather than the driven output.
+        cia.Poke(0x02, 0xFF);
+        cia.Poke(0x00, 0xFF);
+
+        cia.JoyEvent(2, function, true);
+
+        Assert.Equal(expected, cia.Peek(0x00));
+    }
+
+    [Theory]
+    [InlineData(JoystickFunction.Up, 0xFE)]
+    [InlineData(JoystickFunction.Fire, 0xEF)]
+    public void JoystickOne_OverridesPortBOutputPins(
+        JoystickFunction function,
+        byte expected)
+    {
+        Cia1 cia = system.Cia1!;
+
+        cia.Poke(0x03, 0xFF);
+        cia.Poke(0x01, 0xFF);
+
+        cia.JoyEvent(1, function, true);
+
+        Assert.Equal(expected, cia.Peek(0x01));
+    }
+
+    [Fact]
+    public void JoystickPorts_ReadIndependentlyWhilePortsDriveHigh()
+    {
+        Cia1 cia = system.Cia1!;
+
+        cia.Poke(0x02, 0xFF);
+        cia.Poke(0x00, 0xFF);
+        cia.Poke(0x03, 0xFF);
+        cia.Poke(0x01, 0xFF);
+
+        cia.JoyEvent(1, JoystickFunction.Left, true);
+        cia.JoyEvent(2, JoystickFunction.Up, true);
+
+        Assert.Equal(0xFB, cia.Peek(0x01));
+        Assert.Equal(0xFE, cia.Peek(0x00));
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void KeySet_DrivesTheJoystickPortItIsMappedTo(int port)
+    {
+        Cia1 cia = system.Cia1!;
+        JoystickMap original1 = cia.Joy1Map;
+        JoystickMap original2 = cia.Joy2Map;
+
+        try
+        {
+            // Leave the ports in the driven-high state the KERNAL keyboard
+            // scan produces, so this also covers the pin-state read.
+            cia.Poke(0x02, 0xFF);
+            cia.Poke(0x00, 0xFF);
+            cia.Poke(0x03, 0xFF);
+            cia.Poke(0x01, 0xFF);
+
+            cia.Joy1Map = port == 1 ? JoystickMap.KeySet1 : JoystickMap.None;
+            cia.Joy2Map = port == 2 ? JoystickMap.KeySet1 : JoystickMap.None;
+
+            cia.KeyEvent(
+                new KeyboardEventArgs(cia.KeySet1.Right, ModifierKeys.None, true),
+                false);
+
+            if (port == 1)
+                Assert.Equal(0xF7, cia.Peek(0x01));
+            else
+                Assert.Equal(0xF7, cia.Peek(0x00));
+        }
+        finally
+        {
+            cia.Joy1Map = original1;
+            cia.Joy2Map = original2;
+        }
+    }
 }
